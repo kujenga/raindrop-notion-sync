@@ -27,7 +27,7 @@ Notion too.
 | Raindrop ID     | `rich_text` 🔑 | `_id` (primary key)        |
 | Link            | `url`          | `link`                     |
 | Excerpt         | `rich_text`    | `excerpt`                  |
-| Tags            | `multi_select` | `tags`                     |
+| Tags            | `rich_text`    | `tags` (comma-joined)      |
 | Type            | `select`       | `type`                     |
 | Domain          | `rich_text`    | `domain`                   |
 | Important       | `checkbox`     | `important`                |

@@ -31,7 +31,11 @@ const bookmarks = worker.database("bookmarks", {
       "Raindrop ID": Schema.richText(),
       Link: Schema.url(),
       Excerpt: Schema.richText(),
-      Tags: Schema.multiSelect([]),
+      // rich_text rather than multi_select: the managed database schema is
+      // read-only, so Notion will not auto-create multi_select options from
+      // incoming tag values — they get silently dropped. Comma-joined text is
+      // the supported way to carry arbitrary, unknown-ahead-of-time tags.
+      Tags: Schema.richText(),
       Type: Schema.select(RAINDROP_TYPES.map((name) => ({ name }))),
       Domain: Schema.richText(),
       Important: Schema.checkbox(),
@@ -81,7 +85,7 @@ worker.sync("raindropSync", {
         "Raindrop ID": Builder.richText(String(item._id)),
         Link: Builder.url(item.link),
         Excerpt: Builder.richText(item.excerpt ?? ""),
-        Tags: Builder.multiSelect(...(item.tags ?? [])),
+        Tags: Builder.richText((item.tags ?? []).join(", ")),
         Type: Builder.select(item.type || "link"),
         Domain: Builder.richText(item.domain ?? ""),
         Important: Builder.checkbox(Boolean(item.important)),
