@@ -59,6 +59,17 @@ bun run login        # ntn login
 
 ### 3. Configure secrets
 
+For **local** runs, secrets are read from a `.env` file (gitignored — see
+`.env.example`):
+
+```bash
+cp .env.example .env
+# then edit .env and set RAINDROP_TOKEN (and optionally RAINDROP_COLLECTION_ID)
+```
+
+For the **deployed** worker, set secrets as remote environment variables (only
+works after the worker exists — i.e. after the first `bun run deploy`):
+
 ```bash
 ntn workers env set RAINDROP_TOKEN=<your-raindrop-token>
 
@@ -67,15 +78,16 @@ ntn workers env set RAINDROP_TOKEN=<your-raindrop-token>
 ntn workers env set RAINDROP_COLLECTION_ID=0
 ```
 
-For local testing you also need a Notion API token
-(`ntn workers env set NOTION_API_TOKEN=ntn_...`). See `.env.example`.
-
-### 4. Run locally and deploy
+### 4. Preview, run locally, and deploy
 
 ```bash
-bun run dev          # ntn workers dev   — test the sync locally
-bun run deploy       # ntn workers deploy
+bun run preview      # local dry-run: prints the computed changes, writes nothing
+bun run deploy       # deploy the worker (creates the managed database)
+bun run trigger      # run the deployed sync now, bypassing the 30m schedule
 ```
+
+`bun run dev` runs the sync locally and writes to Notion (needs the database to
+exist, so run it after the first deploy). All local commands load `.env`.
 
 ## Configuration
 
@@ -96,12 +108,14 @@ src/
 
 ## Scripts
 
-| Command             | Description                     |
-| ------------------- | ------------------------------- |
-| `bun run typecheck` | Type-check with `tsc --noEmit`. |
-| `bun run dev`       | Run the worker locally.         |
-| `bun run deploy`    | Deploy the worker to Notion.    |
-| `bun run login`     | Authenticate the Notion CLI.    |
+| Command             | Description                                          |
+| ------------------- | ---------------------------------------------------- |
+| `bun run typecheck` | Type-check with `tsc --noEmit`.                      |
+| `bun run preview`   | Local dry-run of the sync (no writes to Notion).     |
+| `bun run dev`       | Run the sync locally and write to Notion.            |
+| `bun run trigger`   | Trigger the deployed sync to run now.                |
+| `bun run deploy`    | Deploy the worker to Notion.                         |
+| `bun run login`     | Authenticate the Notion CLI.                         |
 
 ## License
 

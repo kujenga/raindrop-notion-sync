@@ -2,11 +2,12 @@
   "name": "raindrop-notion-sync",
   "version": "0.1.0",
   "description": "Notion Worker that syncs Raindrop.io bookmarks into a managed Notion database",
-  "type": "module",
   "private": true,
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "dev": "ntn workers dev",
+    "preview": "ntn workers sync trigger --local --preview raindropSync",
+    "dev": "ntn workers sync trigger --local raindropSync",
+    "trigger": "ntn workers sync trigger raindropSync",
     "deploy": "ntn workers deploy",
     "login": "ntn login"
   },
@@ -16,6 +17,7 @@
   "devDependencies": {
     "@types/node": "^26.0.0",
     "ntn": "^0.17.0",
+    "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }
 }
