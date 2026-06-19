@@ -3,6 +3,8 @@
  * @see https://developer.raindrop.io/
  */
 
+import { gunzipSync } from "node:zlib";
+
 const API_BASE = "https://api.raindrop.io/rest/v1";
 
 /** Maximum items per page allowed by the Raindrop API. */
@@ -32,6 +34,8 @@ export interface Raindrop {
   highlights?: RaindropHighlight[];
   /** Id of the collection this bookmark belongs to (-1 = Unsorted). */
   collectionId: number;
+  /** Permanent-copy (Pro archive) status. `ready` means a snapshot exists. */
+  cache?: { status: string; size?: number; created?: string };
 }
 
 /** A Raindrop collection (folder). Only the fields we consume are typed. */
@@ -124,4 +128,29 @@ export async function getCollections(
 export async function getAllTags(token: string): Promise<string[]> {
   const data = await raindropGet<TagsResponse>(token, "/tags/0");
   return (data.items ?? []).map((t) => t._id).filter(Boolean);
+}
+
+/**
+ * Fetch the Raindrop "permanent copy" (Pro archive) of a bookmark as HTML.
+ *
+ * The `/raindrop/{id}/cache` endpoint 303-redirects to a storage URL serving a
+ * gzip-compressed HTML snapshot of the page. Only call this when the bookmark's
+ * `cache.status === "ready"` — otherwise the endpoint redirects to the live URL.
+ * Returns null if the archive can't be retrieved.
+ */
+export async function fetchPermanentCopyHtml(
+  token: string,
+  id: number,
+): Promise<string | null> {
+  // Cross-origin redirect to storage: fetch follows it and (per the fetch
+  // spec) strips the Authorization header so the presigned URL isn't rejected.
+  const res = await fetch(`${API_BASE}/raindrop/${id}/cache`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return null;
+
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length === 0) return null;
+  const isGzip = buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+  return (isGzip ? gunzipSync(buf) : buf).toString("utf8");
 }
