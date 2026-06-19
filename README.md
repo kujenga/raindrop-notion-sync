@@ -54,11 +54,22 @@ dropping nav, ads, and boilerplate. The page body is then laid out as:
 ## Article                 (the full cleaned text)
 ```
 
-Because the option-bearing managed schema can only be migrated at deploy time
-and articles are expensive to fetch, `contentSync` runs incrementally: it walks
-bookmarks newest-first, keeps a cursor so each article is cleaned **once**, and
-retries items whose permanent copy isn't built yet. While content syncing is on,
-the metadata sync stops writing the page body so the two don't conflict.
+Because articles are expensive to fetch and clean, `contentSync` runs
+incrementally and avoids redundant work:
+
+- It walks bookmarks newest-first and keeps a **cursor**, so unchanged bookmarks
+  aren't re-scanned (this persists across runs and redeploys).
+- It records each cleaned article's permanent-copy version, so a bookmark that's
+  merely re-touched (a new tag, a moved collection) **skips the model call** —
+  the existing body is left in place. An article is re-cleaned only when its
+  permanent copy is rebuilt.
+- It cleans a batch with **bounded concurrency** (up to 8 model calls at once).
+- It retries bookmarks whose permanent copy isn't built yet.
+
+While content syncing is on, the metadata sync stops writing the page body so the
+two don't conflict. One trade-off of cleaning an article only once: notes or
+highlights added **after** its article has been synced won't appear in the body
+until the article is re-cleaned (e.g. the page is re-archived).
 
 #### Native chips and the deploy-time snapshot
 

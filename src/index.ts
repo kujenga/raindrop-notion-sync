@@ -253,32 +253,41 @@ function buildFullBody(item: Raindrop, extracted: ExtractedArticle): string {
   return parts.join("\n\n");
 }
 
-/** Per-execute work bounds for the content sync. */
-const CONTENT_PER_PAGE = 8;
-const MAX_MODEL_CALLS_PER_CALL = 8;
-const MAX_PENDING = 200;
+/** How many bookmarks to consider per execute call (bounds per-call time). */
+const CONTENT_PER_PAGE = 16;
+/** Max concurrent Gemini cleanups in flight at once. */
+const MODEL_CONCURRENCY = 8;
+/** Cap the retry backlog so the persisted state stays small. */
+const MAX_PENDING = 500;
 const EPOCH = "1970-01-01T00:00:00.000Z";
 
 interface ContentState {
   /** Raindrop page index within the current run. */
   page?: number;
-  /** `lastUpdate` watermark; items at/below this are considered already done. */
+  /** `lastUpdate` watermark; items at/below this aren't re-scanned. */
   cursor?: string;
   /** Max `lastUpdate` seen this run; becomes the next run's cursor. */
   maxSeen?: string;
   /** Ids whose permanent copy wasn't ready yet, retried on later runs. */
   pending?: number[];
+  /**
+   * id → the permanent copy's `cache.created` time (ms) we last cleaned. Lets a
+   * bookmark that's merely been re-touched (a new tag, moved collection) skip
+   * the Gemini call entirely — its article is unchanged, so the existing body
+   * is left in place. Persists across runs and redeploys with the sync state.
+   */
+  done?: Record<string, number>;
 }
 
 /**
  * Sync cleaned full-article bodies into Notion (`incremental` mode so the
- * cursor persists across runs and each article is cleaned only once). Walks
- * bookmarks newest-first, stops at the cursor, and defers items whose Raindrop
- * permanent copy isn't built yet to a `pending` list retried next run.
+ * cursor and `done` map persist across runs/redeploys). Walks bookmarks
+ * newest-first, stops at the cursor, skips articles already cleaned at their
+ * current version, cleans the rest with bounded concurrency, and defers items
+ * whose permanent copy isn't built yet to a `pending` list retried next run.
  *
- * NOTE: the per-call/per-page bounds below are tuned for correctness and the
- * test collection; revisit them before a full-library backfill once real
- * per-execution timing is known.
+ * NOTE: the per-call bounds are tuned for correctness and the test collection;
+ * revisit them before a full-library backfill once real timing is known.
  */
 worker.sync("contentSync", {
   database: bookmarks,
@@ -293,25 +302,19 @@ worker.sync("contentSync", {
     const page = state?.page ?? 0;
     const cursor = state?.cursor ?? EPOCH;
     let maxSeen = state?.maxSeen ?? cursor;
-    let pending = [...(state?.pending ?? [])];
-    const changes: ReturnType<typeof buildUpsert>[] = [];
-    let modelBudget = MAX_MODEL_CALLS_PER_CALL;
+    const pending = new Set(state?.pending ?? []);
+    const done: Record<string, number> = { ...(state?.done ?? {}) };
 
-    // Retry previously-deferred items at the start of each run.
-    if (page === 0 && pending.length > 0) {
-      const stillPending: number[] = [];
-      for (const id of pending) {
+    // Gather this call's candidates: a bounded batch of retries (first page of a
+    // run) plus the next page of the delta.
+    const candidates: Raindrop[] = [];
+    if (page === 0 && pending.size > 0) {
+      for (const id of [...pending].slice(0, CONTENT_PER_PAGE)) {
+        pending.delete(id);
         const item = await getRaindrop(token, id);
-        if (!item) continue; // deleted upstream; the replace sync drops the page
-        const result = await buildContentBody(item, token, apiKey, modelBudget > 0);
-        if (result.usedModel) modelBudget--;
-        if (result.deferred) stillPending.push(id);
-        changes.push(buildUpsert(item, result.body));
+        if (item) candidates.push(item);
       }
-      pending = stillPending;
     }
-
-    // Scan the delta (bookmarks changed since the cursor), newest first.
     await raindropPacer.wait();
     const items = await getRaindrops(token, collectionId, page, CONTENT_PER_PAGE);
     let reachedEnd = items.length < CONTENT_PER_PAGE;
@@ -321,67 +324,110 @@ worker.sync("contentSync", {
         break;
       }
       if (item.lastUpdate > maxSeen) maxSeen = item.lastUpdate;
-      const result = await buildContentBody(item, token, apiKey, modelBudget > 0);
-      if (result.usedModel) modelBudget--;
-      if (result.deferred && pending.length < MAX_PENDING) pending.push(item._id);
-      changes.push(buildUpsert(item, result.body));
+      candidates.push(item);
+    }
+
+    // Classify without spending any model calls.
+    const changes: ReturnType<typeof buildUpsert>[] = [];
+    const toClean: Raindrop[] = [];
+    for (const item of candidates) {
+      const version = articleVersion(item);
+      if (version !== null && done[String(item._id)] === version) {
+        continue; // article already synced at this version — leave the body alone
+      }
+      if (version === null) {
+        // No ready permanent copy: write annotations now, retry the article if
+        // a copy could still be built.
+        if (isArchivable(item)) pending.add(item._id);
+        changes.push(buildUpsert(item, buildAnnotations(item)));
+        continue;
+      }
+      toClean.push(item);
+    }
+
+    // Clean the article batch with bounded concurrency; defer any overflow.
+    for (const item of toClean.slice(CONTENT_PER_PAGE)) {
+      pending.add(item._id);
+      changes.push(buildUpsert(item, buildAnnotations(item)));
+    }
+    const results = await mapWithConcurrency(
+      toClean.slice(0, CONTENT_PER_PAGE),
+      MODEL_CONCURRENCY,
+      async (item) => {
+        try {
+          return { item, extracted: await fetchAndCleanArticle(item, token, apiKey) };
+        } catch (err) {
+          console.error(`contentSync: article failed for ${item._id}:`, err);
+          return { item, extracted: null };
+        }
+      },
+    );
+    for (const { item, extracted } of results) {
+      if (extracted) {
+        changes.push(buildUpsert(item, buildFullBody(item, extracted)));
+        done[String(item._id)] = articleVersion(item) as number;
+      } else {
+        if (pending.size < MAX_PENDING) pending.add(item._id);
+        changes.push(buildUpsert(item, buildAnnotations(item)));
+      }
     }
 
     const hasMore = !reachedEnd;
     const nextState: ContentState = hasMore
-      ? { page: page + 1, cursor, maxSeen, pending }
-      : { cursor: maxSeen, pending };
+      ? { page: page + 1, cursor, maxSeen, pending: [...pending], done }
+      : { cursor: maxSeen, pending: [...pending], done };
     return { changes, hasMore, nextState };
   },
 });
 
+/** A web bookmark that Raindrop can keep a permanent copy of. */
+function isArchivable(item: Raindrop): boolean {
+  return isHttpUrl(item.link);
+}
+
 /**
- * Build a bookmark's page body, fetching and cleaning the full article when its
- * Raindrop permanent copy is ready and model budget remains. Falls back to just
- * the annotations, signalling `deferred` so the article is retried later.
+ * The version key for a bookmark's archived article: the permanent copy's
+ * creation time in ms, or null when there's no ready copy to clean.
  */
-async function buildContentBody(
+function articleVersion(item: Raindrop): number | null {
+  if (!isArchivable(item) || item.cache?.status !== "ready" || !item.cache.created) {
+    return null;
+  }
+  const ms = Date.parse(item.cache.created);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/** Fetch the permanent copy and clean it into a summary + article. */
+async function fetchAndCleanArticle(
   item: Raindrop,
   token: string,
   apiKey: string,
-  allowModel: boolean,
-): Promise<{ body: string; deferred: boolean; usedModel: boolean }> {
-  const annotations = buildAnnotations(item);
-  const archivable = isHttpUrl(item.link);
-  const cacheReady = item.cache?.status === "ready";
+): Promise<ExtractedArticle | null> {
+  await raindropPacer.wait();
+  const html = await fetchPermanentCopyHtml(token, item._id);
+  if (!html) return null;
+  const rough = htmlToRoughMarkdown(html);
+  await geminiPacer.wait();
+  return extractArticle(rough, apiKey, { title: item.title, url: item.link });
+}
 
-  if (!archivable || (!cacheReady && item.cache?.status === undefined)) {
-    // No article to archive, or Raindrop isn't keeping a copy: annotations only.
-    return { body: annotations, deferred: false, usedModel: false };
-  }
-  if (!cacheReady) {
-    // Permanent copy still building — show annotations now, fetch later.
-    return { body: annotations, deferred: true, usedModel: false };
-  }
-  if (!allowModel) {
-    return { body: annotations, deferred: true, usedModel: false };
-  }
-
-  try {
-    await raindropPacer.wait();
-    const html = await fetchPermanentCopyHtml(token, item._id);
-    if (!html) return { body: annotations, deferred: true, usedModel: false };
-
-    const rough = htmlToRoughMarkdown(html);
-    await geminiPacer.wait();
-    const extracted = await extractArticle(rough, apiKey, {
-      title: item.title,
-      url: item.link,
-    });
-    if (!extracted) {
-      // Model ran but returned nothing usable — don't burn budget retrying.
-      return { body: annotations, deferred: false, usedModel: true };
+/** Map over items with at most `limit` promises in flight at once. */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  async function run(): Promise<void> {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i] as T);
     }
-    return { body: buildFullBody(item, extracted), deferred: false, usedModel: true };
-  } catch (err) {
-    console.error(`contentSync: failed to build article for ${item._id}:`, err);
-    return { body: annotations, deferred: true, usedModel: false };
   }
+  const workers = Array.from({ length: Math.min(limit, items.length) }, run);
+  await Promise.all(workers);
+  return results;
 }
 
 /**
