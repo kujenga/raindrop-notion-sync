@@ -39,6 +39,27 @@ in Raindrop are removed from Notion too.
 The page body contains the Raindrop **note** and **highlights** (when present),
 and the page icon is set from the bookmark cover image.
 
+### Full article content (optional)
+
+With `SYNC_CONTENT=1` and a `GEMINI_API_KEY`, a second `incremental` sync
+(`contentSync`) also writes the **full article** into each page body. For each
+bookmark it fetches the Raindrop **permanent copy** (Pro archive), converts the
+HTML to Markdown, and asks `gemini-3.1-flash-lite` to render a clean article —
+dropping nav, ads, and boilerplate. The page body is then laid out as:
+
+```
+> 🤖 AI summary: …        (model-written, clearly labelled)
+## Note / ## Highlights    (your own annotations)
+---
+## Article                 (the full cleaned text)
+```
+
+Because the option-bearing managed schema can only be migrated at deploy time
+and articles are expensive to fetch, `contentSync` runs incrementally: it walks
+bookmarks newest-first, keeps a cursor so each article is cleaned **once**, and
+retries items whose permanent copy isn't built yet. While content syncing is on,
+the metadata sync stops writing the page body so the two don't conflict.
+
 #### Native chips and the deploy-time snapshot
 
 `Tags` and `Collection` are native Notion `multi_select` / `select` columns. A
@@ -127,6 +148,8 @@ exist, so run it after the first deploy). All local commands load `.env`.
 | `RAINDROP_TAG_OPTIONS`        | auto     | `[]`    | `Tags` options — managed by `refresh-options`.    |
 | `RAINDROP_COLLECTION_OPTIONS` | auto     | `[]`    | `Collection` options — managed by the same.       |
 | `RAINDROP_COLLECTION_MAP`     | auto     | `{}`    | Collection id → name — managed by the same.       |
+| `SYNC_CONTENT`                | no       | `0`     | `1` to sync the full cleaned article body.        |
+| `GEMINI_API_KEY`              | if above | —       | Google Gemini key, used to clean article content. |
 
 The sync schedule (default every 30 minutes) is set in `src/index.ts`.
 

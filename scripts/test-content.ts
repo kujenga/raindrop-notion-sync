@@ -4,7 +4,7 @@
  * Usage: bun scripts/test-content.ts [raindropId]
  */
 import { fetchPermanentCopyHtml } from "../src/raindrop.ts";
-import { cleanArticleMarkdown, htmlToRoughMarkdown } from "../src/content.ts";
+import { extractArticle, htmlToRoughMarkdown } from "../src/content.ts";
 
 const token = process.env.RAINDROP_TOKEN;
 const key = process.env.GEMINI_API_KEY;
@@ -30,11 +30,12 @@ const rough = htmlToRoughMarkdown(html);
 console.log("rough markdown length:", rough.length);
 
 console.time("gemini");
-const clean = await cleanArticleMarkdown(rough, key, {
+const extracted = await extractArticle(rough, key, {
   title: item.title,
   url: item.link,
 });
 console.timeEnd("gemini");
-console.log("clean markdown length:", clean?.length ?? null);
+console.log("summary:", extracted?.summary);
+console.log("article markdown length:", extracted?.article.length ?? null);
 console.log("\n===== CLEAN ARTICLE MARKDOWN =====\n");
-console.log(clean);
+console.log(extracted?.article);

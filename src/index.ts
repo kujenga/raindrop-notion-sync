@@ -2,7 +2,18 @@ import { Worker } from "@notionhq/workers";
 import * as Builder from "@notionhq/workers/builder";
 import * as Schema from "@notionhq/workers/schema";
 import type { SelectOption } from "@notionhq/workers/types";
-import { getRaindrops, PER_PAGE, type Raindrop } from "./raindrop.js";
+import {
+  fetchPermanentCopyHtml,
+  getRaindrop,
+  getRaindrops,
+  PER_PAGE,
+  type Raindrop,
+} from "./raindrop.js";
+import {
+  extractArticle,
+  htmlToRoughMarkdown,
+  type ExtractedArticle,
+} from "./content.js";
 
 const worker = new Worker();
 export default worker;
@@ -60,6 +71,17 @@ const COLLECTION_OPTIONS = parseOptionsEnv(process.env.RAINDROP_COLLECTION_OPTIO
 /** Maps a Raindrop collection id (as a string) to its display name. */
 const COLLECTION_NAMES = parseMapEnv(process.env.RAINDROP_COLLECTION_MAP);
 
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+/**
+ * When enabled, the `contentSync` capability fetches each bookmark's Raindrop
+ * permanent copy and stores a cleaned full-article body on the Notion page.
+ * Requires a GEMINI_API_KEY. While on, the metadata sync stops writing the
+ * page body so it doesn't clobber the richer one contentSync produces.
+ */
+const CONTENT_ENABLED =
+  /^(1|true|yes|on)$/i.test(process.env.SYNC_CONTENT ?? "") &&
+  Boolean(GEMINI_API_KEY);
+
 /**
  * Notion database that mirrors Raindrop bookmarks. Notion creates and
  * migrates this database on deploy; rows are matched on "Raindrop ID".
@@ -99,57 +121,36 @@ const raindropPacer = worker.pacer("raindrop", {
   intervalMs: 60_000,
 });
 
+/** Pace Gemini calls used to clean article content. */
+const geminiPacer = worker.pacer("gemini", {
+  allowedRequests: 60,
+  intervalMs: 60_000,
+});
+
 interface SyncState {
   page: number;
 }
 
+/**
+ * Mirror Raindrop metadata into Notion and handle deletions (`replace` mode).
+ * When content syncing is on, this leaves the page body alone — `contentSync`
+ * owns it — and omitting `pageContentMarkdown` preserves the existing content.
+ */
 worker.sync("raindropSync", {
   database: bookmarks,
   mode: "replace",
   schedule: "30m",
   execute: async (state: SyncState | undefined) => {
-    const token = process.env.RAINDROP_TOKEN;
-    if (!token) {
-      throw new Error(
-        "RAINDROP_TOKEN is not configured. Set it with `ntn workers env set RAINDROP_TOKEN=...`",
-      );
-    }
+    const token = requireToken();
     const collectionId = Number(process.env.RAINDROP_COLLECTION_ID ?? "0");
     const page = state?.page ?? 0;
 
     await raindropPacer.wait();
     const items = await getRaindrops(token, collectionId, page);
 
-    const changes = items.map((item) => {
-      const markdown = buildPageMarkdown(item);
-      const tags = item.tags ?? [];
-      // Only tags that have a corresponding option survive as multi_select
-      // chips; the rest are carried by the "Tags (raw)" column until the next
-      // deploy refreshes the option list. (Also drop tags containing commas,
-      // which the multi_select wire format uses as its option separator.)
-      const knownTags = TAG_OPTIONS.length === 0 ? [] : tags.filter((t) => !t.includes(","));
-      return {
-      type: "upsert" as const,
-      key: String(item._id),
-      upstreamUpdatedAt: item.lastUpdate,
-      ...(isHttpUrl(item.cover) ? { icon: Builder.imageIcon(item.cover) } : {}),
-      ...(markdown ? { pageContentMarkdown: markdown } : {}),
-      properties: {
-        Title: Builder.title(item.title || item.link || "(untitled)"),
-        "Raindrop ID": Builder.richText(String(item._id)),
-        Link: Builder.url(item.link),
-        Excerpt: Builder.richText(item.excerpt ?? ""),
-        Tags: Builder.multiSelect(...knownTags),
-        "Tags (raw)": Builder.richText(tags.join(", ")),
-        Collection: Builder.select(collectionName(item.collectionId)),
-        Type: Builder.select(item.type || "link"),
-        Domain: Builder.richText(item.domain ?? ""),
-        Important: Builder.checkbox(Boolean(item.important)),
-        Created: Builder.dateTime(item.created),
-        "Last Updated": Builder.dateTime(item.lastUpdate),
-      },
-      };
-    });
+    const changes = items.map((item) =>
+      buildUpsert(item, CONTENT_ENABLED ? "" : buildAnnotations(item)),
+    );
 
     // A short page means we've reached the end of the collection.
     const hasMore = items.length === PER_PAGE;
@@ -162,8 +163,54 @@ worker.sync("raindropSync", {
   },
 });
 
-/** Render a bookmark's note and highlights into markdown for the page body. */
-function buildPageMarkdown(item: Raindrop): string {
+function requireToken(): string {
+  const token = process.env.RAINDROP_TOKEN;
+  if (!token) {
+    throw new Error(
+      "RAINDROP_TOKEN is not configured. Set it with `ntn workers env set RAINDROP_TOKEN=...`",
+    );
+  }
+  return token;
+}
+
+/** Map a bookmark to the Notion property values (shared by both syncs). */
+function buildProperties(item: Raindrop) {
+  const tags = item.tags ?? [];
+  // Only tags that have a corresponding option survive as multi_select chips;
+  // the rest are carried by the "Tags (raw)" column until the next deploy
+  // refreshes the option list. (Also drop tags containing commas, which the
+  // multi_select wire format uses as its option separator.)
+  const knownTags = TAG_OPTIONS.length === 0 ? [] : tags.filter((t) => !t.includes(","));
+  return {
+    Title: Builder.title(item.title || item.link || "(untitled)"),
+    "Raindrop ID": Builder.richText(String(item._id)),
+    Link: Builder.url(item.link),
+    Excerpt: Builder.richText(item.excerpt ?? ""),
+    Tags: Builder.multiSelect(...knownTags),
+    "Tags (raw)": Builder.richText(tags.join(", ")),
+    Collection: Builder.select(collectionName(item.collectionId)),
+    Type: Builder.select(item.type || "link"),
+    Domain: Builder.richText(item.domain ?? ""),
+    Important: Builder.checkbox(Boolean(item.important)),
+    Created: Builder.dateTime(item.created),
+    "Last Updated": Builder.dateTime(item.lastUpdate),
+  };
+}
+
+/** Assemble an upsert change. An empty `body` omits page content (preserved). */
+function buildUpsert(item: Raindrop, body: string) {
+  return {
+    type: "upsert" as const,
+    key: String(item._id),
+    upstreamUpdatedAt: item.lastUpdate,
+    ...(isHttpUrl(item.cover) ? { icon: Builder.imageIcon(item.cover) } : {}),
+    ...(body ? { pageContentMarkdown: body } : {}),
+    properties: buildProperties(item),
+  };
+}
+
+/** The user's own annotations: note + highlights. */
+function buildAnnotations(item: Raindrop): string {
   const sections: string[] = [];
 
   if (item.note?.trim()) {
@@ -184,6 +231,157 @@ function buildPageMarkdown(item: Raindrop): string {
   }
 
   return sections.join("\n\n");
+}
+
+/**
+ * Full page body when an article has been extracted: a clearly-labelled AI
+ * summary, then the user's own notes/highlights, then a divider and the full
+ * cleaned article — so the top is a self-contained digest and the original
+ * text follows below.
+ */
+function buildFullBody(item: Raindrop, extracted: ExtractedArticle): string {
+  const parts: string[] = [];
+  if (extracted.summary) {
+    parts.push(`> 🤖 **AI summary:** ${extracted.summary}`);
+  }
+  const annotations = buildAnnotations(item);
+  if (annotations) {
+    parts.push(annotations);
+  }
+  parts.push("---");
+  parts.push(`## Article\n\n${extracted.article}`);
+  return parts.join("\n\n");
+}
+
+/** Per-execute work bounds for the content sync. */
+const CONTENT_PER_PAGE = 8;
+const MAX_MODEL_CALLS_PER_CALL = 8;
+const MAX_PENDING = 200;
+const EPOCH = "1970-01-01T00:00:00.000Z";
+
+interface ContentState {
+  /** Raindrop page index within the current run. */
+  page?: number;
+  /** `lastUpdate` watermark; items at/below this are considered already done. */
+  cursor?: string;
+  /** Max `lastUpdate` seen this run; becomes the next run's cursor. */
+  maxSeen?: string;
+  /** Ids whose permanent copy wasn't ready yet, retried on later runs. */
+  pending?: number[];
+}
+
+/**
+ * Sync cleaned full-article bodies into Notion (`incremental` mode so the
+ * cursor persists across runs and each article is cleaned only once). Walks
+ * bookmarks newest-first, stops at the cursor, and defers items whose Raindrop
+ * permanent copy isn't built yet to a `pending` list retried next run.
+ *
+ * NOTE: the per-call/per-page bounds below are tuned for correctness and the
+ * test collection; revisit them before a full-library backfill once real
+ * per-execution timing is known.
+ */
+worker.sync("contentSync", {
+  database: bookmarks,
+  mode: "incremental",
+  schedule: "1h",
+  execute: async (state: ContentState | undefined) => {
+    if (!CONTENT_ENABLED) return { changes: [], hasMore: false };
+    const token = requireToken();
+    const apiKey = GEMINI_API_KEY as string;
+    const collectionId = Number(process.env.RAINDROP_COLLECTION_ID ?? "0");
+
+    const page = state?.page ?? 0;
+    const cursor = state?.cursor ?? EPOCH;
+    let maxSeen = state?.maxSeen ?? cursor;
+    let pending = [...(state?.pending ?? [])];
+    const changes: ReturnType<typeof buildUpsert>[] = [];
+    let modelBudget = MAX_MODEL_CALLS_PER_CALL;
+
+    // Retry previously-deferred items at the start of each run.
+    if (page === 0 && pending.length > 0) {
+      const stillPending: number[] = [];
+      for (const id of pending) {
+        const item = await getRaindrop(token, id);
+        if (!item) continue; // deleted upstream; the replace sync drops the page
+        const result = await buildContentBody(item, token, apiKey, modelBudget > 0);
+        if (result.usedModel) modelBudget--;
+        if (result.deferred) stillPending.push(id);
+        changes.push(buildUpsert(item, result.body));
+      }
+      pending = stillPending;
+    }
+
+    // Scan the delta (bookmarks changed since the cursor), newest first.
+    await raindropPacer.wait();
+    const items = await getRaindrops(token, collectionId, page, CONTENT_PER_PAGE);
+    let reachedEnd = items.length < CONTENT_PER_PAGE;
+    for (const item of items) {
+      if (item.lastUpdate <= cursor) {
+        reachedEnd = true;
+        break;
+      }
+      if (item.lastUpdate > maxSeen) maxSeen = item.lastUpdate;
+      const result = await buildContentBody(item, token, apiKey, modelBudget > 0);
+      if (result.usedModel) modelBudget--;
+      if (result.deferred && pending.length < MAX_PENDING) pending.push(item._id);
+      changes.push(buildUpsert(item, result.body));
+    }
+
+    const hasMore = !reachedEnd;
+    const nextState: ContentState = hasMore
+      ? { page: page + 1, cursor, maxSeen, pending }
+      : { cursor: maxSeen, pending };
+    return { changes, hasMore, nextState };
+  },
+});
+
+/**
+ * Build a bookmark's page body, fetching and cleaning the full article when its
+ * Raindrop permanent copy is ready and model budget remains. Falls back to just
+ * the annotations, signalling `deferred` so the article is retried later.
+ */
+async function buildContentBody(
+  item: Raindrop,
+  token: string,
+  apiKey: string,
+  allowModel: boolean,
+): Promise<{ body: string; deferred: boolean; usedModel: boolean }> {
+  const annotations = buildAnnotations(item);
+  const archivable = isHttpUrl(item.link);
+  const cacheReady = item.cache?.status === "ready";
+
+  if (!archivable || (!cacheReady && item.cache?.status === undefined)) {
+    // No article to archive, or Raindrop isn't keeping a copy: annotations only.
+    return { body: annotations, deferred: false, usedModel: false };
+  }
+  if (!cacheReady) {
+    // Permanent copy still building — show annotations now, fetch later.
+    return { body: annotations, deferred: true, usedModel: false };
+  }
+  if (!allowModel) {
+    return { body: annotations, deferred: true, usedModel: false };
+  }
+
+  try {
+    await raindropPacer.wait();
+    const html = await fetchPermanentCopyHtml(token, item._id);
+    if (!html) return { body: annotations, deferred: true, usedModel: false };
+
+    const rough = htmlToRoughMarkdown(html);
+    await geminiPacer.wait();
+    const extracted = await extractArticle(rough, apiKey, {
+      title: item.title,
+      url: item.link,
+    });
+    if (!extracted) {
+      // Model ran but returned nothing usable — don't burn budget retrying.
+      return { body: annotations, deferred: false, usedModel: true };
+    }
+    return { body: buildFullBody(item, extracted), deferred: false, usedModel: true };
+  } catch (err) {
+    console.error(`contentSync: failed to build article for ${item._id}:`, err);
+    return { body: annotations, deferred: true, usedModel: false };
+  }
 }
 
 /**

@@ -90,9 +90,10 @@ export async function getRaindrops(
   token: string,
   collectionId: number,
   page: number,
+  perpage: number = PER_PAGE,
 ): Promise<Raindrop[]> {
   const params = new URLSearchParams({
-    perpage: String(PER_PAGE),
+    perpage: String(perpage),
     page: String(page),
     sort: "-lastUpdate",
   });
@@ -101,6 +102,19 @@ export async function getRaindrops(
     `/raindrops/${collectionId}?${params}`,
   );
   return data.items ?? [];
+}
+
+/** Fetch a single raindrop by id, or null if it no longer exists. */
+export async function getRaindrop(
+  token: string,
+  id: number,
+): Promise<Raindrop | null> {
+  try {
+    const data = await raindropGet<{ item: Raindrop }>(token, `/raindrop/${id}`);
+    return data.item ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
