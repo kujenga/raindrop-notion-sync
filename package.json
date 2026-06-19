@@ -5,6 +5,7 @@
   "private": true,
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "build": "tsc",
     "preview": "ntn workers sync trigger --local --preview raindropSync",
     "dev": "ntn workers sync trigger --local raindropSync",
     "trigger": "ntn workers sync trigger raindropSync",
