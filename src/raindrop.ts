@@ -30,12 +30,49 @@ export interface Raindrop {
   created: string;
   lastUpdate: string;
   highlights?: RaindropHighlight[];
+  /** Id of the collection this bookmark belongs to (-1 = Unsorted). */
+  collectionId: number;
+}
+
+/** A Raindrop collection (folder). Only the fields we consume are typed. */
+export interface RaindropCollection {
+  _id: number;
+  title: string;
 }
 
 interface RaindropsResponse {
   result: boolean;
   items: Raindrop[];
   count: number;
+}
+
+interface CollectionsResponse {
+  result: boolean;
+  items: RaindropCollection[];
+}
+
+interface TagsResponse {
+  result: boolean;
+  items: { _id: string; count: number }[];
+}
+
+/** GET a Raindrop endpoint and return the parsed JSON, throwing on non-2xx. */
+async function raindropGet<T>(token: string, path: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `Raindrop API request failed (${res.status} ${res.statusText}): ${body}`,
+    );
+  }
+
+  return (await res.json()) as T;
 }
 
 /**
@@ -50,25 +87,41 @@ export async function getRaindrops(
   collectionId: number,
   page: number,
 ): Promise<Raindrop[]> {
-  const url = new URL(`${API_BASE}/raindrops/${collectionId}`);
-  url.searchParams.set("perpage", String(PER_PAGE));
-  url.searchParams.set("page", String(page));
-  url.searchParams.set("sort", "-lastUpdate");
-
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
+  const params = new URLSearchParams({
+    perpage: String(PER_PAGE),
+    page: String(page),
+    sort: "-lastUpdate",
   });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(
-      `Raindrop API request failed (${res.status} ${res.statusText}): ${body}`,
-    );
-  }
-
-  const data = (await res.json()) as RaindropsResponse;
+  const data = await raindropGet<RaindropsResponse>(
+    token,
+    `/raindrops/${collectionId}?${params}`,
+  );
   return data.items ?? [];
+}
+
+/**
+ * Fetch every collection in the user's account (root collections plus all
+ * nested children). Used to label each bookmark with its collection name.
+ */
+export async function getCollections(
+  token: string,
+): Promise<RaindropCollection[]> {
+  const [root, children] = await Promise.all([
+    raindropGet<CollectionsResponse>(token, "/collections"),
+    raindropGet<CollectionsResponse>(token, "/collections/childrens"),
+  ]);
+  const seen = new Map<number, RaindropCollection>();
+  for (const c of [...(root.items ?? []), ...(children.items ?? [])]) {
+    seen.set(c._id, { _id: c._id, title: c.title });
+  }
+  return [...seen.values()];
+}
+
+/**
+ * Fetch every tag in the user's account (across all collections).
+ * The `_id` of each tag entry is the tag name.
+ */
+export async function getAllTags(token: string): Promise<string[]> {
+  const data = await raindropGet<TagsResponse>(token, "/tags/0");
+  return (data.items ?? []).map((t) => t._id).filter(Boolean);
 }

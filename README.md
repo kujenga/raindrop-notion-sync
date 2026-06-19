@@ -14,28 +14,52 @@ Raindrop REST API ──fetch──▶ worker.sync("raindropSync") ──upserts
 ```
 
 The worker registers a single `sync` capability. On each run it pages through a
-Raindrop collection and returns upserts; the Notion Workers runtime handles
-creating, updating, and deleting pages so the database mirrors Raindrop. The
-sync runs in `replace` mode, so bookmarks removed in Raindrop are removed from
-Notion too.
+Raindrop collection (collection `0` = every collection) and returns upserts; the
+Notion Workers runtime handles creating, updating, and deleting pages so the
+database mirrors Raindrop. The sync runs in `replace` mode, so bookmarks removed
+in Raindrop are removed from Notion too.
 
 ### Database schema
 
-| Notion property | Type           | Raindrop source            |
-| --------------- | -------------- | -------------------------- |
-| Title           | `title`        | `title`                    |
-| Raindrop ID     | `rich_text` 🔑 | `_id` (primary key)        |
-| Link            | `url`          | `link`                     |
-| Excerpt         | `rich_text`    | `excerpt`                  |
-| Tags            | `rich_text`    | `tags` (comma-joined)      |
-| Type            | `select`       | `type`                     |
-| Domain          | `rich_text`    | `domain`                   |
-| Important       | `checkbox`     | `important`                |
-| Created         | `date`         | `created`                  |
-| Last Updated    | `date`         | `lastUpdate`               |
+| Notion property | Type           | Raindrop source                  |
+| --------------- | -------------- | -------------------------------- |
+| Title           | `title`        | `title`                          |
+| Raindrop ID     | `rich_text` 🔑 | `_id` (primary key)              |
+| Link            | `url`          | `link`                           |
+| Excerpt         | `rich_text`    | `excerpt`                        |
+| Tags            | `multi_select` | `tags`                           |
+| Tags (raw)      | `rich_text`    | `tags` (comma-joined, see below) |
+| Collection      | `select`       | `collectionId` → collection name |
+| Type            | `select`       | `type`                           |
+| Domain          | `rich_text`    | `domain`                         |
+| Important       | `checkbox`     | `important`                      |
+| Created         | `date`         | `created`                        |
+| Last Updated    | `date`         | `lastUpdate`                     |
 
 The page body contains the Raindrop **note** and **highlights** (when present),
 and the page icon is set from the bookmark cover image.
+
+#### Native chips and the deploy-time snapshot
+
+`Tags` and `Collection` are native Notion `multi_select` / `select` columns. A
+**managed** Notion database can only declare its select options at **deploy
+time** — Notion won't auto-create options when a sync writes an unknown value.
+So `bun run deploy` first runs `bun run refresh-options`, which fetches your
+current tags and collections from Raindrop and stores them as worker env vars
+(`RAINDROP_TAG_OPTIONS`, `RAINDROP_COLLECTION_OPTIONS`, `RAINDROP_COLLECTION_MAP`)
+that the schema reads. Nothing account-specific is committed to the repo.
+
+The trade-off: a tag or collection created in Raindrop **after** your last
+deploy has no option yet. The **`Tags (raw)`** column is the safety net — it
+always carries every tag verbatim, so nothing is lost; re-deploy to refresh the
+chips.
+
+### Where the database lives
+
+There is no way to choose the database's location in code — Notion creates it,
+owned by the worker's bot, on first deploy. Find it via search or the deploy
+output, then **move it** into any teamspace or page from the Notion UI. The
+worker syncs by database id, so moving or renaming it is safe.
 
 ## Getting started
 
@@ -82,19 +106,27 @@ ntn workers env set RAINDROP_COLLECTION_ID=0
 
 ```bash
 bun run preview      # local dry-run: prints the computed changes, writes nothing
-bun run deploy       # deploy the worker (creates the managed database)
+bun run deploy       # refresh tag/collection options, then deploy the worker
 bun run trigger      # run the deployed sync now, bypassing the 30m schedule
 ```
+
+`bun run deploy` runs `bun run refresh-options` first (fetches your tags +
+collections from Raindrop, writes them to `.env`, and pushes them to the
+deployed worker) so the `Tags` and `Collection` columns get native options. Re-
+run `bun run deploy` whenever you want those option lists refreshed.
 
 `bun run dev` runs the sync locally and writes to Notion (needs the database to
 exist, so run it after the first deploy). All local commands load `.env`.
 
 ## Configuration
 
-| Variable                 | Required | Default | Description                               |
-| ------------------------ | -------- | ------- | ----------------------------------------- |
-| `RAINDROP_TOKEN`         | yes      | —       | Raindrop API token (test or OAuth token). |
-| `RAINDROP_COLLECTION_ID` | no       | `0`     | Collection to sync (`0` = all bookmarks). |
+| Variable                      | Required | Default | Description                                       |
+| ----------------------------- | -------- | ------- | ------------------------------------------------- |
+| `RAINDROP_TOKEN`              | yes      | —       | Raindrop API token (test or OAuth token).         |
+| `RAINDROP_COLLECTION_ID`      | no       | `0`     | Collection to sync (`0` = all bookmarks).         |
+| `RAINDROP_TAG_OPTIONS`        | auto     | `[]`    | `Tags` options — managed by `refresh-options`.    |
+| `RAINDROP_COLLECTION_OPTIONS` | auto     | `[]`    | `Collection` options — managed by the same.       |
+| `RAINDROP_COLLECTION_MAP`     | auto     | `{}`    | Collection id → name — managed by the same.       |
 
 The sync schedule (default every 30 minutes) is set in `src/index.ts`.
 
@@ -102,20 +134,23 @@ The sync schedule (default every 30 minutes) is set in `src/index.ts`.
 
 ```
 src/
-  index.ts      Worker, database schema, and sync registration
-  raindrop.ts   Typed Raindrop.io API client
+  index.ts             Worker, database schema, and sync registration
+  raindrop.ts          Typed Raindrop.io API client
+scripts/
+  refresh-options.ts   Fetches tag/collection select options for deploy
 ```
 
 ## Scripts
 
-| Command             | Description                                          |
-| ------------------- | ---------------------------------------------------- |
-| `bun run typecheck` | Type-check with `tsc --noEmit`.                      |
-| `bun run preview`   | Local dry-run of the sync (no writes to Notion).     |
-| `bun run dev`       | Run the sync locally and write to Notion.            |
-| `bun run trigger`   | Trigger the deployed sync to run now.                |
-| `bun run deploy`    | Deploy the worker to Notion.                         |
-| `bun run login`     | Authenticate the Notion CLI.                         |
+| Command                  | Description                                            |
+| ------------------------ | ------------------------------------------------------ |
+| `bun run typecheck`      | Type-check with `tsc --noEmit`.                        |
+| `bun run preview`        | Local dry-run of the sync (no writes to Notion).       |
+| `bun run dev`            | Run the sync locally and write to Notion.              |
+| `bun run trigger`        | Trigger the deployed sync to run now.                  |
+| `bun run refresh-options`| Refresh `Tags`/`Collection` options from Raindrop.     |
+| `bun run deploy`         | Refresh options, then deploy the worker to Notion.     |
+| `bun run login`          | Authenticate the Notion CLI.                           |
 
 ## License
 

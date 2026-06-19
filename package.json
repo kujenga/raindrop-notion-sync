@@ -6,10 +6,11 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
+    "refresh-options": "bun scripts/refresh-options.ts",
     "preview": "ntn workers sync trigger --local --preview raindropSync",
     "dev": "ntn workers sync trigger --local raindropSync",
     "trigger": "ntn workers sync trigger raindropSync",
-    "deploy": "ntn workers deploy",
+    "deploy": "bun run refresh-options && ntn workers deploy",
     "login": "ntn login"
   },
   "dependencies": {
