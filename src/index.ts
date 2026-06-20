@@ -254,7 +254,7 @@ function buildFullBody(item: Raindrop, extracted: ExtractedArticle): string {
 }
 
 /** How many bookmarks to consider per execute call (bounds per-call time). */
-const CONTENT_PER_PAGE = 16;
+const CONTENT_PER_PAGE = 8;
 /** Max concurrent Gemini cleanups in flight at once. */
 const MODEL_CONCURRENCY = 8;
 /** Cap the retry backlog so the persisted state stays small. */
@@ -336,9 +336,10 @@ worker.sync("contentSync", {
         continue; // article already synced at this version — leave the body alone
       }
       if (version === null) {
-        // No ready permanent copy: write annotations now, retry the article if
-        // a copy could still be built.
-        if (isArchivable(item)) pending.add(item._id);
+        // No ready permanent copy: write annotations now, and retry the article
+        // only if a copy could still be built (skip terminal-failure states so
+        // they don't churn in the retry backlog forever).
+        if (isArchivePending(item)) pending.add(item._id);
         changes.push(buildUpsert(item, buildAnnotations(item)));
         continue;
       }
@@ -383,6 +384,18 @@ worker.sync("contentSync", {
 /** A web bookmark that Raindrop can keep a permanent copy of. */
 function isArchivable(item: Raindrop): boolean {
   return isHttpUrl(item.link);
+}
+
+/**
+ * Whether a bookmark's permanent copy is still worth waiting for. Terminal
+ * Raindrop statuses ("failed", "invalid-origin", "invalid-timeout", …) never
+ * become ready, so they must not be retried; an absent or "retry" status means
+ * Raindrop is still working on the copy.
+ */
+function isArchivePending(item: Raindrop): boolean {
+  if (!isArchivable(item) || item.cache?.status === "ready") return false;
+  const status = item.cache?.status;
+  return status === undefined || status === "retry";
 }
 
 /**
