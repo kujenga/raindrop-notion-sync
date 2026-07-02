@@ -115,9 +115,19 @@ const bookmarks = worker.database("bookmarks", {
   },
 });
 
-/** Pace requests under Raindrop's 120 requests/minute limit. */
+// Raindrop allows 120 requests/minute per token. The metadata and content
+// syncs use SEPARATE pacers (never a shared one): a replace-mode metadata sync
+// bursts many requests per cycle, and a shared pacer's scheduled-time state
+// persists — one sync's burst would stall the other's `wait()` for minutes.
+// The two budgets sum to <= 120/min so the account limit is still respected.
 const raindropPacer = worker.pacer("raindrop", {
-  allowedRequests: 120,
+  allowedRequests: 40,
+  intervalMs: 60_000,
+});
+
+/** Pace the content sync's Raindrop calls (list + permanent-copy fetches). */
+const contentApiPacer = worker.pacer("content-api", {
+  allowedRequests: 80,
   intervalMs: 60_000,
 });
 
@@ -316,11 +326,12 @@ worker.sync("contentSync", {
     if (page === 0 && pending.size > 0) {
       for (const id of [...pending].slice(0, CONTENT_PER_PAGE)) {
         pending.delete(id);
+        await contentApiPacer.wait();
         const item = await getRaindrop(token, id);
         if (item) candidates.push(item);
       }
     }
-    await raindropPacer.wait();
+    await contentApiPacer.wait();
     const items = await getRaindrops(token, collectionId, page, CONTENT_PER_PAGE);
     let reachedEnd = items.length < CONTENT_PER_PAGE;
     for (const item of items) {
@@ -421,7 +432,7 @@ async function fetchAndCleanArticle(
   token: string,
   apiKey: string,
 ): Promise<ExtractedArticle | null> {
-  await raindropPacer.wait();
+  await contentApiPacer.wait();
   const html = await fetchPermanentCopyHtml(token, item._id);
   if (!html) return null;
   const rough = htmlToRoughMarkdown(html);

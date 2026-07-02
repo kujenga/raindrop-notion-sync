@@ -67,6 +67,8 @@ async function raindropGet<T>(token: string, path: string): Promise<T> {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
+    // Fail fast instead of hanging a sync execute on a stalled connection.
+    signal: AbortSignal.timeout(20_000),
   });
 
   if (!res.ok) {
@@ -158,13 +160,19 @@ export async function fetchPermanentCopyHtml(
 ): Promise<string | null> {
   // Cross-origin redirect to storage: fetch follows it and (per the fetch
   // spec) strips the Authorization header so the presigned URL isn't rejected.
-  const res = await fetch(`${API_BASE}/raindrop/${id}/cache`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) return null;
+  // Any error/timeout returns null so the caller defers rather than hanging.
+  try {
+    const res = await fetch(`${API_BASE}/raindrop/${id}/cache`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(25_000),
+    });
+    if (!res.ok) return null;
 
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length === 0) return null;
-  const isGzip = buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b;
-  return (isGzip ? gunzipSync(buf) : buf).toString("utf8");
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length === 0) return null;
+    const isGzip = buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+    return (isGzip ? gunzipSync(buf) : buf).toString("utf8");
+  } catch {
+    return null;
+  }
 }

@@ -50,6 +50,8 @@ export async function extractArticle(
   const res = await fetch(`${GEMINI_ENDPOINT}?key=${apiKey}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    // Fail fast instead of hanging the whole batch on a stalled model call.
+    signal: AbortSignal.timeout(60_000),
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
       contents: [
