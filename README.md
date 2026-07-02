@@ -162,7 +162,10 @@ exist, so run it after the first deploy). All local commands load `.env`.
 | `SYNC_CONTENT`                | no       | `0`     | `1` to sync the full cleaned article body.        |
 | `GEMINI_API_KEY`              | if above | —       | Google Gemini key, used to clean article content. |
 
-The sync schedule (default every 30 minutes) is set in `src/index.ts`.
+Sync schedules are set in `src/index.ts`: `raindropSync` (metadata) runs daily,
+`contentSync` (article bodies) hourly. Because `raindropSync` re-mirrors the
+whole library each run, a frequent schedule is the main cost driver — keep it
+infrequent for large libraries.
 
 ## Project layout
 

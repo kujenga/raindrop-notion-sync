@@ -139,7 +139,12 @@ interface SyncState {
 worker.sync("raindropSync", {
   database: bookmarks,
   mode: "replace",
-  schedule: "30m",
+  // Daily: replace mode re-mirrors the whole library each cycle (~78 pages =
+  // ~78 billable runs for ~3,900 bookmarks), so a frequent schedule is
+  // expensive. Metadata (tags/collection/type) rarely needs sub-day freshness;
+  // this also handles deletes via mark-and-sweep. Article bodies stay fresher
+  // via contentSync's own (hourly, incremental, cheap) schedule.
+  schedule: "1d",
   execute: async (state: SyncState | undefined) => {
     const token = requireToken();
     const collectionId = Number(process.env.RAINDROP_COLLECTION_ID ?? "0");
