@@ -274,6 +274,12 @@ const CONTENT_PER_PAGE = 8;
 const MODEL_CONCURRENCY = 8;
 /** Cap the retry backlog so the persisted state stays small. */
 const MAX_PENDING = 500;
+/**
+ * Skip permanent copies larger than this (gzipped bytes). Multi-MB archives —
+ * usually repos/heavy pages, not articles — would block the event loop during
+ * synchronous gunzip/parse and time out the execute.
+ */
+const MAX_CACHE_BYTES = 4_000_000;
 const EPOCH = "1970-01-01T00:00:00.000Z";
 
 interface ContentState {
@@ -356,6 +362,14 @@ worker.sync("contentSync", {
         // only if a copy could still be built (skip terminal-failure states so
         // they don't churn in the retry backlog forever).
         if (isArchivePending(item)) pending.add(item._id);
+        changes.push(buildUpsert(item, buildAnnotations(item)));
+        continue;
+      }
+      if ((item.cache?.size ?? 0) > MAX_CACHE_BYTES) {
+        // Huge archives (tens of MB) block the event loop during gunzip/parse
+        // long enough to blow the execution timeout. Skip the article body and
+        // mark it done so it isn't retried.
+        done[String(item._id)] = version;
         changes.push(buildUpsert(item, buildAnnotations(item)));
         continue;
       }

@@ -15,6 +15,12 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 const MAX_INPUT_CHARS = 40_000;
 /** Cap the stored article so Notion pages stay a reasonable size. */
 const MAX_ARTICLE_CHARS = 12_000;
+/**
+ * Cap the HTML fed to the (synchronous) Markdown parser. Some archived pages
+ * are tens of MB; parsing them blocks the event loop long enough to blow the
+ * platform execution timeout, so we only parse the head of the document.
+ */
+const MAX_HTML_CHARS = 1_500_000;
 
 const SYSTEM_PROMPT = `You are given a raw Markdown dump of a web page (converted from an archived HTML snapshot that still contains navigation, ads, and other page chrome). Produce two things:
 
@@ -34,7 +40,10 @@ export interface ExtractedArticle {
 
 /** Convert archived HTML to rough Markdown and truncate it for the model. */
 export function htmlToRoughMarkdown(html: string): string {
-  return NodeHtmlMarkdown.translate(html).slice(0, MAX_INPUT_CHARS);
+  return NodeHtmlMarkdown.translate(html.slice(0, MAX_HTML_CHARS)).slice(
+    0,
+    MAX_INPUT_CHARS,
+  );
 }
 
 /**
