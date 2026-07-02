@@ -77,9 +77,12 @@ until the article is re-cleaned (e.g. the page is re-archived).
 **managed** Notion database can only declare its select options at **deploy
 time** — Notion won't auto-create options when a sync writes an unknown value.
 So `bun run deploy` first runs `bun run refresh-options`, which fetches your
-current tags and collections from Raindrop and stores them as worker env vars
-(`RAINDROP_TAG_OPTIONS`, `RAINDROP_COLLECTION_OPTIONS`, `RAINDROP_COLLECTION_MAP`)
-that the schema reads. Nothing account-specific is committed to the repo.
+current tags and collections from Raindrop and writes them into
+`src/raindrop-options.ts` — a generated module compiled into the deployed
+bundle and read by the schema. It's committed **empty** upstream (so the repo
+stays generic) and filled in by your own deploy; it holds only tag/collection
+names, no secrets. To keep the local churn out of `git status`, run
+`git update-index --skip-worktree src/raindrop-options.ts`.
 
 The trade-off: a tag or collection created in Raindrop **after** your last
 deploy has no option yet. The **`Tags (raw)`** column is the safety net — it
@@ -156,11 +159,11 @@ exist, so run it after the first deploy). All local commands load `.env`.
 | ----------------------------- | -------- | ------- | ------------------------------------------------- |
 | `RAINDROP_TOKEN`              | yes      | —       | Raindrop API token (test or OAuth token).         |
 | `RAINDROP_COLLECTION_ID`      | no       | `0`     | Collection to sync (`0` = all bookmarks).         |
-| `RAINDROP_TAG_OPTIONS`        | auto     | `[]`    | `Tags` options — managed by `refresh-options`.    |
-| `RAINDROP_COLLECTION_OPTIONS` | auto     | `[]`    | `Collection` options — managed by the same.       |
-| `RAINDROP_COLLECTION_MAP`     | auto     | `{}`    | Collection id → name — managed by the same.       |
 | `SYNC_CONTENT`                | no       | `0`     | `1` to sync the full cleaned article body.        |
 | `GEMINI_API_KEY`              | if above | —       | Google Gemini key, used to clean article content. |
+
+(`Tags`/`Collection` options are not env vars — they're generated into
+`src/raindrop-options.ts`; see above.)
 
 Sync schedules are set in `src/index.ts`: `raindropSync` (metadata) runs daily,
 `contentSync` (article bodies) hourly. Because `raindropSync` re-mirrors the
@@ -171,10 +174,12 @@ infrequent for large libraries.
 
 ```
 src/
-  index.ts             Worker, database schema, and sync registration
-  raindrop.ts          Typed Raindrop.io API client
+  index.ts               Worker, database schema, and sync registration
+  raindrop.ts            Typed Raindrop.io API client
+  content.ts             Permanent-copy → clean-article pipeline (Gemini)
+  raindrop-options.ts    Generated Tags/Collection options (empty upstream)
 scripts/
-  refresh-options.ts   Fetches tag/collection select options for deploy
+  refresh-options.ts     Regenerates raindrop-options.ts from Raindrop
 ```
 
 ## Scripts

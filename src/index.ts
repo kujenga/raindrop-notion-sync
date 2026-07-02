@@ -1,7 +1,6 @@
 import { Worker } from "@notionhq/workers";
 import * as Builder from "@notionhq/workers/builder";
 import * as Schema from "@notionhq/workers/schema";
-import type { SelectOption } from "@notionhq/workers/types";
 import {
   fetchPermanentCopyHtml,
   getRaindrop,
@@ -14,6 +13,11 @@ import {
   htmlToRoughMarkdown,
   type ExtractedArticle,
 } from "./content.js";
+import {
+  COLLECTION_NAMES,
+  COLLECTION_OPTIONS,
+  TAG_OPTIONS,
+} from "./raindrop-options.js";
 
 const worker = new Worker();
 export default worker;
@@ -28,48 +32,14 @@ const RAINDROP_TYPES = [
   "audio",
 ] as const;
 
-/**
- * Tag and Collection select options are populated at deploy time from the
- * user's Raindrop account and passed in as JSON env vars by `bun run deploy`
- * (see scripts/refresh-options.ts). They are read here, at module load, so
- * Notion migrates the managed schema with real options on deploy.
- *
- * Why env vars and not a generated source file: this keeps the repository
- * generic for any user (no account-specific data committed) while still
- * giving native multi_select / select columns. The trade-off is that the
- * option lists are a deploy-time snapshot — a tag or collection created in
- * Raindrop after the last deploy has no option yet. The "Tags (raw)" column
- * below is the safety net for that gap; re-running `bun run deploy` refreshes
- * the lists.
- */
-function parseOptionsEnv(json: string | undefined): SelectOption[] {
-  if (!json) return [];
-  try {
-    const parsed: unknown = JSON.parse(json);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (o): o is SelectOption =>
-        typeof o === "object" && o !== null && typeof (o as SelectOption).name === "string",
-    );
-  } catch {
-    return [];
-  }
-}
-
-function parseMapEnv(json: string | undefined): Record<string, string> {
-  if (!json) return {};
-  try {
-    const parsed: unknown = JSON.parse(json);
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : {};
-  } catch {
-    return {};
-  }
-}
-
-const TAG_OPTIONS = parseOptionsEnv(process.env.RAINDROP_TAG_OPTIONS);
-const COLLECTION_OPTIONS = parseOptionsEnv(process.env.RAINDROP_COLLECTION_OPTIONS);
-/** Maps a Raindrop collection id (as a string) to its display name. */
-const COLLECTION_NAMES = parseMapEnv(process.env.RAINDROP_COLLECTION_MAP);
+// TAG_OPTIONS / COLLECTION_OPTIONS / COLLECTION_NAMES come from the generated
+// ./raindrop-options module. A managed database can only declare its
+// select/multi_select options at deploy time, so `bun run refresh-options`
+// (run by `bun run deploy`) regenerates that module from the user's Raindrop
+// account; it's compiled into the deployed bundle and read here at module load.
+// The trade-off is a deploy-time snapshot: a tag/collection created since the
+// last deploy has no option yet — the "Tags (raw)" column is the safety net,
+// and re-deploying refreshes the lists.
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 /**
