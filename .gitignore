@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.ntn/
+*.log
+.env
+.env.local
+.DS_Store
+
+# ntn worker identity — workspace/worker-specific, created by `ntn workers deploy`
+workers.json
+workers.*.json
