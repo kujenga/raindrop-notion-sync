@@ -18,6 +18,7 @@ import {
   COLLECTION_OPTIONS,
   TAG_OPTIONS,
 } from "./raindrop-options.js";
+import type { Schedule } from "@notionhq/workers/types";
 
 const worker = new Worker();
 export default worker;
@@ -51,6 +52,34 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const CONTENT_ENABLED =
   /^(1|true|yes|on)$/i.test(process.env.SYNC_CONTENT ?? "") &&
   Boolean(GEMINI_API_KEY);
+
+/**
+ * Resolve a sync's schedule from an env var, defaulting to `fallback`. Accepts
+ * the same forms as the Notion Workers SDK (`Schedule`): "continuous", "manual",
+ * or an interval like "30m", "6h", "1d". An unrecognized value warns and falls
+ * back rather than throwing, so a typo can't brick the deployed worker (the SDK
+ * would otherwise reject it at registration). Changing the schedule takes effect
+ * on the next `bun run deploy`, since it's read when the worker module loads.
+ */
+function scheduleFromEnv(name: string, fallback: Schedule): Schedule {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  if (raw === "continuous" || raw === "manual" || /^\d+[mhd]$/.test(raw)) {
+    return raw as Schedule;
+  }
+  console.warn(
+    `Ignoring invalid ${name}="${raw}"; expected "continuous", "manual", or ` +
+      `an interval like "30m"/"1h"/"1d". Falling back to "${fallback}".`,
+  );
+  return fallback;
+}
+
+// Metadata (`replace` mode) re-mirrors the whole library each run, so it's the
+// main cost driver — default it to daily and let large libraries slow it
+// further. The content sync is incremental (cheap), so it defaults to hourly.
+// Both are overridable per deploy; see the README's Configuration section.
+const METADATA_SCHEDULE = scheduleFromEnv("METADATA_SCHEDULE", "1d");
+const CONTENT_SCHEDULE = scheduleFromEnv("CONTENT_SCHEDULE", "1h");
 
 /**
  * Notion database that mirrors Raindrop bookmarks. Notion creates and
@@ -119,12 +148,13 @@ interface SyncState {
 worker.sync("raindropSync", {
   database: bookmarks,
   mode: "replace",
-  // Daily: replace mode re-mirrors the whole library each cycle (~78 pages =
-  // ~78 billable runs for ~3,900 bookmarks), so a frequent schedule is
-  // expensive. Metadata (tags/collection/type) rarely needs sub-day freshness;
-  // this also handles deletes via mark-and-sweep. Article bodies stay fresher
-  // via contentSync's own (hourly, incremental, cheap) schedule.
-  schedule: "1d",
+  // Daily by default (METADATA_SCHEDULE): replace mode re-mirrors the whole
+  // library each cycle (~78 pages = ~78 billable runs for ~3,900 bookmarks), so
+  // a frequent schedule is expensive. Metadata (tags/collection/type) rarely
+  // needs sub-day freshness; this also handles deletes via mark-and-sweep.
+  // Article bodies stay fresher via contentSync's own (incremental, cheap)
+  // schedule.
+  schedule: METADATA_SCHEDULE,
   execute: async (state: SyncState | undefined) => {
     const token = requireToken();
     const collectionId = Number(process.env.RAINDROP_COLLECTION_ID ?? "0");
@@ -283,7 +313,7 @@ interface ContentState {
 worker.sync("contentSync", {
   database: bookmarks,
   mode: "incremental",
-  schedule: "1h",
+  schedule: CONTENT_SCHEDULE, // hourly by default; see CONTENT_SCHEDULE
   execute: async (state: ContentState | undefined) => {
     if (!CONTENT_ENABLED) return { changes: [], hasMore: false };
     const token = requireToken();

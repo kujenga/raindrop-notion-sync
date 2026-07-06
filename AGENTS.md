@@ -41,9 +41,11 @@ docs/DESIGN.md           Architecture + design-decision rationale
 ```
 
 The worker registers two `sync` capabilities in `src/index.ts`:
-`raindropSync` (metadata, `replace` mode, daily) and `contentSync` (optional
-full-article bodies, hourly, gated on `SYNC_CONTENT=1`). See
-[docs/DESIGN.md](docs/DESIGN.md) for how they interact.
+`raindropSync` (metadata, `replace` mode, default daily) and `contentSync`
+(optional full-article bodies, default hourly, gated on `SYNC_CONTENT=1`).
+Schedules are read from `METADATA_SCHEDULE` / `CONTENT_SCHEDULE` at module load
+(via `scheduleFromEnv`), so they take effect on deploy. See
+[docs/DESIGN.md](docs/DESIGN.md) for how the two syncs interact.
 
 ## Gotchas — read before editing
 
