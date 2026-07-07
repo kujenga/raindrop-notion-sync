@@ -44,10 +44,10 @@ const RAINDROP_TYPES = [
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 /**
- * When enabled, the `contentSync` capability fetches each bookmark's Raindrop
+ * When enabled, `incrementalSync` also fetches each bookmark's Raindrop
  * permanent copy and stores a cleaned full-article body on the Notion page.
- * Requires a GEMINI_API_KEY. While on, the metadata sync stops writing the
- * page body so it doesn't clobber the richer one contentSync produces.
+ * Requires a GEMINI_API_KEY. While on, `fullSync` stops writing the page body
+ * so it doesn't clobber the richer one incrementalSync produces.
  */
 const CONTENT_ENABLED =
   /^(1|true|yes|on)$/i.test(process.env.SYNC_CONTENT ?? "") &&
@@ -74,12 +74,20 @@ function scheduleFromEnv(name: string, fallback: Schedule): Schedule {
   return fallback;
 }
 
-// Metadata (`replace` mode) re-mirrors the whole library each run, so it's the
-// main cost driver — default it to daily and let large libraries slow it
-// further. The content sync is incremental (cheap), so it defaults to hourly.
+// The full mirror (`fullSync`, replace mode) re-mirrors the whole library each
+// run, so it's the main cost driver — default it to daily and let large
+// libraries slow it further. It's also what propagates deletions.
+const FULL_SYNC_SCHEDULE = scheduleFromEnv("FULL_SYNC_SCHEDULE", "1d");
+// The delta pass (`incrementalSync`) only touches bookmarks past a saved
+// cursor, so it's cheap to run often — hourly keeps new saves fresh.
 // Both are overridable per deploy; see the README's Configuration section.
-const METADATA_SCHEDULE = scheduleFromEnv("METADATA_SCHEDULE", "1d");
-const CONTENT_SCHEDULE = scheduleFromEnv("CONTENT_SCHEDULE", "1h");
+const INCREMENTAL_SYNC_SCHEDULE = scheduleFromEnv(
+  "INCREMENTAL_SYNC_SCHEDULE",
+  "1h",
+);
+
+/** Sentinel cursor: an incremental sync with this cursor has seen nothing yet. */
+const EPOCH = "1970-01-01T00:00:00.000Z";
 
 /**
  * Notion database that mirrors Raindrop bookmarks. Notion creates and
@@ -114,18 +122,18 @@ const bookmarks = worker.database("bookmarks", {
   },
 });
 
-// Raindrop allows 120 requests/minute per token. The metadata and content
-// syncs use SEPARATE pacers (never a shared one): a replace-mode metadata sync
-// bursts many requests per cycle, and a shared pacer's scheduled-time state
-// persists — one sync's burst would stall the other's `wait()` for minutes.
-// The two budgets sum to <= 120/min so the account limit is still respected.
-const raindropPacer = worker.pacer("raindrop", {
+// Raindrop allows 120 requests/minute per token. The two syncs use SEPARATE
+// pacers (never a shared one): a replace-mode full mirror bursts many requests
+// per cycle, and a shared pacer's scheduled-time state persists — one sync's
+// burst would stall the other's `wait()` for minutes. The two budgets sum to
+// <= 120/min so the account limit is still respected.
+const fullSyncPacer = worker.pacer("full-sync", {
   allowedRequests: 40,
   intervalMs: 60_000,
 });
 
-/** Pace the content sync's Raindrop calls (list + permanent-copy fetches). */
-const contentApiPacer = worker.pacer("content-api", {
+/** Pace incrementalSync's Raindrop calls (list + permanent-copy fetches). */
+const incrementalApiPacer = worker.pacer("incremental-api", {
   allowedRequests: 80,
   intervalMs: 60_000,
 });
@@ -141,26 +149,27 @@ interface SyncState {
 }
 
 /**
- * Mirror Raindrop metadata into Notion and handle deletions (`replace` mode).
- * When content syncing is on, this leaves the page body alone — `contentSync`
- * owns it — and omitting `pageContentMarkdown` preserves the existing content.
+ * Full mirror: re-sync every bookmark's metadata and handle deletions
+ * (`replace` mode is the only way removals propagate — an incremental pass
+ * never sees a bookmark that's already gone from Raindrop). When content
+ * syncing is on, this leaves the page body alone — `incrementalSync` owns it —
+ * and omitting `pageContentMarkdown` preserves the existing content.
  */
-worker.sync("raindropSync", {
+worker.sync("fullSync", {
   database: bookmarks,
   mode: "replace",
-  // Daily by default (METADATA_SCHEDULE): replace mode re-mirrors the whole
+  // Daily by default (FULL_SYNC_SCHEDULE): replace mode re-mirrors the whole
   // library each cycle (~78 pages = ~78 billable runs for ~3,900 bookmarks), so
-  // a frequent schedule is expensive. Metadata (tags/collection/type) rarely
-  // needs sub-day freshness; this also handles deletes via mark-and-sweep.
-  // Article bodies stay fresher via contentSync's own (incremental, cheap)
-  // schedule.
-  schedule: METADATA_SCHEDULE,
+  // a frequent schedule is expensive. Day-to-day freshness comes from
+  // incrementalSync instead; this pass exists for deletes (mark-and-sweep) and
+  // as a self-healing full re-mirror.
+  schedule: FULL_SYNC_SCHEDULE,
   execute: async (state: SyncState | undefined) => {
     const token = requireToken();
     const collectionId = Number(process.env.RAINDROP_COLLECTION_ID ?? "0");
     const page = state?.page ?? 0;
 
-    await raindropPacer.wait();
+    await fullSyncPacer.wait();
     const items = await getRaindrops(token, collectionId, page);
 
     const changes = items.map((item) =>
@@ -280,9 +289,8 @@ const MAX_PENDING = 500;
  * synchronous gunzip/parse and time out the execute.
  */
 const MAX_CACHE_BYTES = 4_000_000;
-const EPOCH = "1970-01-01T00:00:00.000Z";
 
-interface ContentState {
+interface IncrementalState {
   /** Raindrop page index within the current run. */
   page?: number;
   /** `lastUpdate` watermark; items at/below this aren't re-scanned. */
@@ -298,48 +306,76 @@ interface ContentState {
    * is left in place. Persists across runs and redeploys with the sync state.
    */
   done?: Record<string, number>;
+  /**
+   * Whether content syncing was on last run. A flip to on restarts the walk
+   * from EPOCH so pre-existing bookmarks get their article backfill — with a
+   * shared cursor already at "now", the backfill would otherwise silently
+   * never happen.
+   */
+  contentOn?: boolean;
 }
 
 /**
- * Sync cleaned full-article bodies into Notion (`incremental` mode so the
- * cursor and `done` map persist across runs/redeploys). Walks bookmarks
- * newest-first, stops at the cursor, skips articles already cleaned at their
- * current version, cleans the rest with bounded concurrency, and defers items
- * whose permanent copy isn't built yet to a `pending` list retried next run.
+ * Delta pass: surface new and recently-changed bookmarks between the full
+ * `fullSync` mirrors, so a fresh save appears within the hour instead of
+ * waiting for the (daily) replace pass. Walks bookmarks newest-first, stops at
+ * the saved cursor, and always upserts metadata + the user's annotations. With
+ * content syncing on it additionally cleans full-article bodies: articles
+ * already cleaned at their current version get a metadata-only upsert (body
+ * preserved), the rest are cleaned with bounded concurrency, and items whose
+ * permanent copy isn't built yet go to a `pending` list retried next run.
  *
- * NOTE: the per-call bounds are tuned for correctness and the test collection;
- * revisit them before a full-library backfill once real timing is known.
+ * It does NOT delete — removals are handled by fullSync's `replace` mode — so
+ * it stays cheap after the first run walks the backlog. `incremental` mode
+ * persists the cursor and `done` map across runs and redeploys, and the cursor
+ * advances only when a run finishes paging, so an interrupted run safely
+ * re-scans from the previous watermark.
+ *
+ * NOTE: the content-mode per-call bounds are tuned for correctness and the
+ * test collection; revisit them before a full-library backfill once real
+ * timing is known.
  */
-worker.sync("contentSync", {
+worker.sync("incrementalSync", {
   database: bookmarks,
   mode: "incremental",
-  schedule: CONTENT_SCHEDULE, // hourly by default; see CONTENT_SCHEDULE
-  execute: async (state: ContentState | undefined) => {
-    if (!CONTENT_ENABLED) return { changes: [], hasMore: false };
+  schedule: INCREMENTAL_SYNC_SCHEDULE,
+  execute: async (state: IncrementalState | undefined) => {
     const token = requireToken();
-    const apiKey = GEMINI_API_KEY as string;
+    const apiKey = GEMINI_API_KEY as string; // only read when CONTENT_ENABLED
     const collectionId = Number(process.env.RAINDROP_COLLECTION_ID ?? "0");
 
-    const page = state?.page ?? 0;
-    const cursor = state?.cursor ?? EPOCH;
-    let maxSeen = state?.maxSeen ?? cursor;
+    // Detect a SYNC_CONTENT flip since the last run. off→on restarts the walk
+    // from EPOCH (article backfill; the done map still skips prior cleans).
+    // on→off keeps the cursor but restarts the in-progress page walk — the
+    // page size differs by mode, so a stale page index could skip items.
+    const flipped =
+      state?.contentOn !== undefined && state.contentOn !== CONTENT_ENABLED;
+    const backfill = flipped && CONTENT_ENABLED;
+    const page = flipped ? 0 : (state?.page ?? 0);
+    const cursor = backfill ? EPOCH : (state?.cursor ?? EPOCH);
+    let maxSeen = state?.maxSeen ?? (backfill ? EPOCH : cursor);
     const pending = new Set(state?.pending ?? []);
     const done: Record<string, number> = { ...(state?.done ?? {}) };
 
-    // Gather this call's candidates: a bounded batch of retries (first page of a
-    // run) plus the next page of the delta.
+    // Metadata-only pages can be large (an upsert per item is cheap); content
+    // pages stay small to bound permanent-copy fetches + model calls per call.
+    const perPage = CONTENT_ENABLED ? CONTENT_PER_PAGE : PER_PAGE;
+
+    // Gather this call's candidates: a bounded batch of article retries (only
+    // processed with content on; otherwise preserved in state for a later
+    // toggle-on) plus the next page of the delta.
     const candidates: Raindrop[] = [];
-    if (page === 0 && pending.size > 0) {
+    if (CONTENT_ENABLED && page === 0 && pending.size > 0) {
       for (const id of [...pending].slice(0, CONTENT_PER_PAGE)) {
         pending.delete(id);
-        await contentApiPacer.wait();
+        await incrementalApiPacer.wait();
         const item = await getRaindrop(token, id);
         if (item) candidates.push(item);
       }
     }
-    await contentApiPacer.wait();
-    const items = await getRaindrops(token, collectionId, page, CONTENT_PER_PAGE);
-    let reachedEnd = items.length < CONTENT_PER_PAGE;
+    await incrementalApiPacer.wait();
+    const items = await getRaindrops(token, collectionId, page, perPage);
+    let reachedEnd = items.length < perPage;
     for (const item of items) {
       if (item.lastUpdate <= cursor) {
         reachedEnd = true;
@@ -353,9 +389,18 @@ worker.sync("contentSync", {
     const changes: ReturnType<typeof buildUpsert>[] = [];
     const toClean: Raindrop[] = [];
     for (const item of candidates) {
+      if (!CONTENT_ENABLED) {
+        // Metadata-only mode: upsert properties + the user's annotations.
+        changes.push(buildUpsert(item, buildAnnotations(item)));
+        continue;
+      }
       const version = articleVersion(item);
       if (version !== null && done[String(item._id)] === version) {
-        continue; // article already synced at this version — leave the body alone
+        // Article already synced at this version: refresh the metadata (this
+        // is what makes a retag or moved collection show up within the hour)
+        // and leave the body alone (an empty body omits pageContentMarkdown).
+        changes.push(buildUpsert(item, ""));
+        continue;
       }
       if (version === null) {
         // No ready permanent copy: write annotations now, and retry the article
@@ -388,7 +433,7 @@ worker.sync("contentSync", {
         try {
           return { item, extracted: await fetchAndCleanArticle(item, token, apiKey) };
         } catch (err) {
-          console.error(`contentSync: article failed for ${item._id}:`, err);
+          console.error(`incrementalSync: article failed for ${item._id}:`, err);
           return { item, extracted: null };
         }
       },
@@ -404,9 +449,10 @@ worker.sync("contentSync", {
     }
 
     const hasMore = !reachedEnd;
-    const nextState: ContentState = hasMore
-      ? { page: page + 1, cursor, maxSeen, pending: [...pending], done }
-      : { cursor: maxSeen, pending: [...pending], done };
+    const contentOn = CONTENT_ENABLED;
+    const nextState: IncrementalState = hasMore
+      ? { page: page + 1, cursor, maxSeen, pending: [...pending], done, contentOn }
+      : { cursor: maxSeen, pending: [...pending], done, contentOn };
     return { changes, hasMore, nextState };
   },
 });
@@ -446,7 +492,7 @@ async function fetchAndCleanArticle(
   token: string,
   apiKey: string,
 ): Promise<ExtractedArticle | null> {
-  await contentApiPacer.wait();
+  await incrementalApiPacer.wait();
   const html = await fetchPermanentCopyHtml(token, item._id);
   if (!html) return null;
   const rough = htmlToRoughMarkdown(html);

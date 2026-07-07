@@ -9,47 +9,57 @@ curious about the trade-offs.
 
 The worker registers two independent `sync` capabilities:
 
-- **`raindropSync`** (metadata) — the always-on sync. It pages through a
-  Raindrop collection and returns upserts; the Notion Workers runtime creates,
-  updates, and deletes pages so the database mirrors Raindrop. It runs in
-  `replace` mode, so a bookmark removed in Raindrop is removed from Notion too
-  (mark-and-sweep). Schedule: `METADATA_SCHEDULE`, default **daily** (`1d`).
-- **`contentSync`** (article bodies) — optional, enabled with `SYNC_CONTENT=1`.
-  It writes the full cleaned article into each page body. Schedule:
-  `CONTENT_SCHEDULE`, default **hourly** (`1h`).
+- **`fullSync`** (full mirror) — pages through the whole Raindrop collection and
+  returns upserts; the Notion Workers runtime creates, updates, and deletes
+  pages so the database mirrors Raindrop. It runs in `replace` mode, so a
+  bookmark removed in Raindrop is removed from Notion too (mark-and-sweep) —
+  this is the only sync that can delete, since an incremental pass never sees a
+  bookmark that's already gone. Schedule: `FULL_SYNC_SCHEDULE`, default
+  **daily** (`1d`).
+- **`incrementalSync`** (delta pass) — walks bookmarks newest-first, stops at a
+  saved cursor, and upserts whatever changed since the last run. It always
+  writes metadata + the user's notes/highlights; with `SYNC_CONTENT=1` it also
+  fetches and cleans the full article body for each new or re-archived bookmark.
+  Schedule: `INCREMENTAL_SYNC_SCHEDULE`, default **hourly** (`1h`).
 
 `replace` mode re-mirrors the whole library every cycle, so its cost scales with
-library size, not with how much changed. That's why `raindropSync` defaults to
-daily rather than every few minutes: for ~3,900 bookmarks a run pages through
-~78 requests, and a frequent schedule multiplies that for metadata that rarely
-needs sub-day freshness. Article bodies stay fresher through `contentSync`'s own
-incremental, cheap schedule. The two schedules are independent and configurable
-per deploy (see the README's Configuration section) precisely because their
-costs differ this much — collapsing them to one value would force either stale
-articles or an expensive metadata re-mirror.
+library size, not with how much changed. That's why `fullSync` defaults to daily
+rather than every few minutes: for ~3,900 bookmarks a run pages through ~78
+requests, and a frequent schedule multiplies that for a full mirror that rarely
+needs sub-day freshness. `incrementalSync` only touches bookmarks past its
+cursor, so it's cheap to run hourly. The two schedules are independent and
+configurable per deploy (see the README's Configuration section) precisely
+because their costs differ this much — collapsing them would force either stale
+updates or an expensive re-mirror.
 
 ### Freshness contract
 
-The schedules produce a deliberate asymmetry worth knowing:
+Which changes surface on which schedule:
 
-- **Content sync off (default):** `contentSync` is a no-op, so *everything* —
-  new bookmarks, edits, and deletions — surfaces on the metadata schedule
-  (daily by default). If you want new bookmarks to appear faster, shorten
-  `METADATA_SCHEDULE`, but remember every run re-mirrors the whole library.
-- **Content sync on:** a new bookmark's page (metadata + article) appears on the
-  content schedule (hourly) — `contentSync` upserts full properties too, not just
-  the body. But **deletions** and **metadata-only edits** (a retag or moved
-  collection on an already-cleaned bookmark) still wait for the daily `replace`
-  pass: incremental mode has no mark-and-sweep, and an unchanged article version
-  is skipped before any metadata is written.
+- **New bookmarks and metadata edits** (a retag, a moved collection) surface on
+  `INCREMENTAL_SYNC_SCHEDULE` (hourly). With content on, an edit to an
+  already-cleaned bookmark refreshes its properties while leaving the article
+  body untouched — the article is re-cleaned only when its permanent copy is
+  rebuilt.
+- **Deletions** wait for the full mirror (`FULL_SYNC_SCHEDULE`, daily), because
+  only `replace` mode does mark-and-sweep. Shorten `FULL_SYNC_SCHEDULE` if you
+  need deletions to propagate faster, remembering every run re-mirrors the whole
+  library.
 
-When content syncing is on, `raindropSync` stops writing the page body (it omits
+One toggle-related subtlety: because the cursor is shared, flipping
+`SYNC_CONTENT` **on** after running without it restarts the incremental walk
+from the beginning so pre-existing bookmarks get their article backfill (the
+`done` version map still prevents redundant model calls). Flipping it **off**
+keeps the cursor; bookmarks edited while content is off get annotation-only
+bodies again.
+
+When content syncing is on, `fullSync` stops writing the page body (it omits
 `pageContentMarkdown`) so the two capabilities don't clobber each other —
-`contentSync` owns the body.
+`incrementalSync` owns the body.
 
 ## The article content pipeline
 
-For each bookmark, `contentSync`:
+With `SYNC_CONTENT=1`, for each new or re-archived bookmark `incrementalSync`:
 
 1. Fetches the Raindrop **permanent copy** (the Pro archive of the page).
 2. Converts the archived HTML to Markdown.

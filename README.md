@@ -85,8 +85,8 @@ This regenerates the options file, creates the worker on first run, pushes your
 the deploy output, then **move it** into any teamspace or page from the Notion
 UI — the worker syncs by database id, so moving or renaming it is safe.
 
-**6. Run it now (optional).** The sync runs on a schedule (daily for metadata),
-but you can trigger a run immediately:
+**6. Run it now (optional).** The sync runs on a schedule (new/changed bookmarks
+hourly, a full mirror daily), but you can trigger a full run immediately:
 
 ```bash
 bun run trigger
@@ -104,8 +104,8 @@ use `bun run preview`.
 | `RAINDROP_COLLECTION_ID` | no       | `0`     | Collection to sync: `0` = all, `-1` = unsorted, `<id>` = a specific collection. |
 | `SYNC_CONTENT`           | no       | `0`     | `1` to also sync the full cleaned article body.    |
 | `GEMINI_API_KEY`         | if `SYNC_CONTENT=1` | — | Google Gemini key, used to clean article content.  |
-| `METADATA_SCHEDULE`      | no       | `1d`    | How often the metadata sync runs (see below).      |
-| `CONTENT_SCHEDULE`       | no       | `1h`    | How often the article-content sync runs.           |
+| `FULL_SYNC_SCHEDULE`     | no       | `1d`    | How often the full mirror runs (see below).        |
+| `INCREMENTAL_SYNC_SCHEDULE` | no    | `1h`    | How often new/changed bookmarks are picked up between full mirrors. |
 
 Set these in `.env` for local runs; `bun run deploy` pushes them to the deployed
 worker. To change a secret on the deployed worker without a full redeploy:
@@ -120,26 +120,28 @@ ntn workers env set RAINDROP_TOKEN=<your-raindrop-token>
 
 ### Schedules
 
-The two syncs run on independent schedules, set via `METADATA_SCHEDULE` (default
-`1d`) and `CONTENT_SCHEDULE` (default `1h`). Each accepts `continuous`, `manual`,
-or an interval like `30m`, `6h`, `1d`; an unrecognized value is ignored (with a
-warning) in favor of the default. A schedule change takes effect on the next
-`bun run deploy`.
+The two syncs run on independent schedules, set via `FULL_SYNC_SCHEDULE`
+(default `1d`) and `INCREMENTAL_SYNC_SCHEDULE` (default `1h`). Each accepts
+`continuous`, `manual`, or an interval like `30m`, `6h`, `1d`; an unrecognized
+value is ignored (with a warning) in favor of the default. A change takes effect
+on the next `bun run deploy`.
 
 They differ on purpose, because the two syncs have very different costs:
 
-- **Metadata** (`raindropSync`) runs in `replace` mode, re-mirroring the *whole*
-  library each run (~78 paged requests per 3,900 bookmarks). Its cost scales with
-  library size, not with how much changed, so a frequent schedule is the main
-  cost driver — **make it less frequent for large libraries.** It's also what
-  propagates deletions.
-- **Article content** (`contentSync`) is incremental — it only processes
-  bookmarks newer than a saved cursor, so most runs do almost nothing. That makes
-  a frequent (hourly) schedule cheap and keeps new articles fresh.
+- **Full mirror** (`fullSync`, default daily) runs in `replace` mode,
+  re-mirroring the *whole* library each run (~78 paged requests per 3,900
+  bookmarks). Its cost scales with library size, not with how much changed, so a
+  frequent schedule is the main cost driver — **make it less frequent for large
+  libraries.** It's also the only sync that propagates **deletions**.
+- **Incremental** (`incrementalSync`, default hourly) is the cheap counterpart:
+  it only processes bookmarks newer than a saved cursor, so most runs do almost
+  nothing. It's what lets a freshly-saved bookmark (and, with `SYNC_CONTENT=1`,
+  its cleaned article) appear within the hour instead of waiting for the daily
+  mirror.
 
-See [docs/DESIGN.md](docs/DESIGN.md#sync-architecture) for the freshness
-trade-offs (e.g. with content off, new bookmarks appear on the metadata
-schedule).
+In short: everything is picked up hourly except deletions, which land on the
+daily mirror. See [docs/DESIGN.md](docs/DESIGN.md#sync-architecture) for the
+full freshness contract.
 
 ## What gets synced
 

@@ -45,12 +45,16 @@ scripts/refresh-options.ts  Regenerates raindrop-options.ts from Raindrop
 docs/DESIGN.md           Architecture + design-decision rationale
 ```
 
-The worker registers two `sync` capabilities in `src/index.ts`:
-`raindropSync` (metadata, `replace` mode, default daily) and `contentSync`
-(optional full-article bodies, default hourly, gated on `SYNC_CONTENT=1`).
-Schedules are read from `METADATA_SCHEDULE` / `CONTENT_SCHEDULE` at module load
-(via `scheduleFromEnv`), so they take effect on deploy. See
-[docs/DESIGN.md](docs/DESIGN.md) for how the two syncs interact.
+The worker registers two `sync` capabilities in `src/index.ts`: `fullSync`
+(whole-library mirror, `replace` mode, default daily — the only sync that
+deletes) and `incrementalSync` (cursor-based delta pass, default hourly — always
+upserts metadata + annotations, and also cleans article bodies when
+`SYNC_CONTENT=1`). Schedules are read from `FULL_SYNC_SCHEDULE` /
+`INCREMENTAL_SYNC_SCHEDULE` at module load (via `scheduleFromEnv`), so they take
+effect on deploy. Note: flipping `SYNC_CONTENT` on restarts the incremental walk
+from EPOCH (article backfill) — see the `contentOn` state flag. See
+[docs/DESIGN.md](docs/DESIGN.md) for how the syncs interact and the freshness
+contract.
 
 ## Gotchas — read before editing
 

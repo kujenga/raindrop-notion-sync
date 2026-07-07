@@ -7,9 +7,9 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "refresh-options": "bun scripts/refresh-options.ts",
-    "preview": "ntn workers sync trigger --local --preview raindropSync",
-    "dev": "ntn workers sync trigger --local raindropSync",
-    "trigger": "ntn workers sync trigger raindropSync",
+    "preview": "ntn workers sync trigger --local --preview fullSync",
+    "dev": "ntn workers sync trigger --local fullSync",
+    "trigger": "ntn workers sync trigger fullSync",
     "deploy": "bun run refresh-options && ntn workers deploy",
     "login": "ntn login"
   },
