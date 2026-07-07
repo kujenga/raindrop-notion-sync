@@ -8,12 +8,17 @@ with the [README](README.md); deeper rationale lives in
 
 A [Notion Worker](https://developers.notion.com/workers/get-started/overview)
 that syncs Raindrop.io bookmarks into a managed Notion database. It runs on
-Notion's Workers platform (Notion hosts and schedules it). TypeScript, built and
-deployed locally with **Bun**; the remote build runs on **npm/node**.
+Notion's Workers platform (Notion hosts and schedules it). TypeScript.
+Dependency resolution goes through **npm** — one committed `package-lock.json`,
+the same lockfile the **npm/node** remote build uses — while **Bun** is the
+local task runner (`bun run …`, `bun scripts/*.ts`).
 
 ## Commands
 
-- `bun install` — install dependencies (this also provides the `ntn` CLI).
+- `npm install` — install dependencies (this also provides the `ntn` CLI). npm
+  owns the lockfile; add/remove deps with `npm install <pkg>`, not `bun add`.
+  `bun install` still works (it migrates from `package-lock.json`), but only
+  npm updates the committed lockfile.
 - `bun run typecheck` — `tsc --noEmit`. **Run this before finishing any change**;
   there is no separate test suite.
 - `bun run preview` — local dry-run of the sync; prints computed changes, writes
@@ -64,6 +69,12 @@ Schedules are read from `METADATA_SCHEDULE` / `CONTENT_SCHEDULE` at module load
 - **The remote build runs on npm/node, not Bun.** Don't introduce build-time
   reliance on Bun-only APIs; `ntn` runs `npm install` → `npm run build` in the
   cloud from git-tracked files.
+- **`package-lock.json` is the single source of truth for dependencies**, and
+  npm is the only resolver — so the versions CI (`npm ci`) and the remote build
+  (`npm install`) resolve are exactly the ones committed, with no second
+  resolver to drift against. There is deliberately no `bun.lock` (it's
+  gitignored). Don't edit the lockfile by hand; let `npm install <pkg>` update
+  it and commit the result.
 - **Secrets** live in `.env` (gitignored) and are pushed to the worker by the
   deploy. Never commit real tokens or a filled `.env`.
 

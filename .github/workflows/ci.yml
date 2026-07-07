@@ -28,10 +28,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+          cache: npm
 
-      # `npm install`, not `npm ci`: the repo commits bun.lock, and npm ci
-      # requires a package-lock.json.
-      - run: npm install
+      # npm is the sole dependency resolver (no bun.lock), so the committed
+      # package-lock.json is exactly what `npm ci` installs here and what the
+      # remote build installs — no floating within semver ranges.
+      - run: npm ci
 
       - run: npm run typecheck
 
