@@ -2,6 +2,12 @@ node_modules/
 dist/
 .ntn/
 *.log
+
+# package-lock.json is the single committed lockfile (npm is the resolver).
+# Bun is only the local task runner; a stray `bun install` migrates from
+# package-lock.json and writes this — keep it out of the repo.
+bun.lock
+bun.lockb
 .env
 .env.local
 .DS_Store
