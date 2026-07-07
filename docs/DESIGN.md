@@ -13,17 +13,35 @@ The worker registers two independent `sync` capabilities:
   Raindrop collection and returns upserts; the Notion Workers runtime creates,
   updates, and deletes pages so the database mirrors Raindrop. It runs in
   `replace` mode, so a bookmark removed in Raindrop is removed from Notion too
-  (mark-and-sweep). Schedule: **daily** (`1d`).
+  (mark-and-sweep). Schedule: `METADATA_SCHEDULE`, default **daily** (`1d`).
 - **`contentSync`** (article bodies) — optional, enabled with `SYNC_CONTENT=1`.
-  It writes the full cleaned article into each page body. Schedule: **hourly**
-  (`1h`).
+  It writes the full cleaned article into each page body. Schedule:
+  `CONTENT_SCHEDULE`, default **hourly** (`1h`).
 
 `replace` mode re-mirrors the whole library every cycle, so its cost scales with
-library size, not with how much changed. That's why `raindropSync` runs daily
-rather than every few minutes: for ~3,900 bookmarks a run pages through ~78
-requests, and a frequent schedule multiplies that for metadata that rarely needs
-sub-day freshness. Article bodies stay fresher through `contentSync`'s own
-hourly, incremental, cheap schedule.
+library size, not with how much changed. That's why `raindropSync` defaults to
+daily rather than every few minutes: for ~3,900 bookmarks a run pages through
+~78 requests, and a frequent schedule multiplies that for metadata that rarely
+needs sub-day freshness. Article bodies stay fresher through `contentSync`'s own
+incremental, cheap schedule. The two schedules are independent and configurable
+per deploy (see the README's Configuration section) precisely because their
+costs differ this much — collapsing them to one value would force either stale
+articles or an expensive metadata re-mirror.
+
+### Freshness contract
+
+The schedules produce a deliberate asymmetry worth knowing:
+
+- **Content sync off (default):** `contentSync` is a no-op, so *everything* —
+  new bookmarks, edits, and deletions — surfaces on the metadata schedule
+  (daily by default). If you want new bookmarks to appear faster, shorten
+  `METADATA_SCHEDULE`, but remember every run re-mirrors the whole library.
+- **Content sync on:** a new bookmark's page (metadata + article) appears on the
+  content schedule (hourly) — `contentSync` upserts full properties too, not just
+  the body. But **deletions** and **metadata-only edits** (a retag or moved
+  collection on an already-cleaned bookmark) still wait for the daily `replace`
+  pass: incremental mode has no mark-and-sweep, and an unchanged article version
+  is skipped before any metadata is written.
 
 When content syncing is on, `raindropSync` stops writing the page body (it omits
 `pageContentMarkdown`) so the two capabilities don't clobber each other —

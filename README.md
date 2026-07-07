@@ -104,6 +104,8 @@ use `bun run preview`.
 | `RAINDROP_COLLECTION_ID` | no       | `0`     | Collection to sync: `0` = all, `-1` = unsorted, `<id>` = a specific collection. |
 | `SYNC_CONTENT`           | no       | `0`     | `1` to also sync the full cleaned article body.    |
 | `GEMINI_API_KEY`         | if `SYNC_CONTENT=1` | — | Google Gemini key, used to clean article content.  |
+| `METADATA_SCHEDULE`      | no       | `1d`    | How often the metadata sync runs (see below).      |
+| `CONTENT_SCHEDULE`       | no       | `1h`    | How often the article-content sync runs.           |
 
 Set these in `.env` for local runs; `bun run deploy` pushes them to the deployed
 worker. To change a secret on the deployed worker without a full redeploy:
@@ -116,10 +118,28 @@ ntn workers env set RAINDROP_TOKEN=<your-raindrop-token>
 `src/raindrop-options.ts` at deploy time (see
 [design notes](docs/DESIGN.md#native-chips-and-the-deploy-time-snapshot)).
 
-The sync **schedules** are set in `src/index.ts`: `raindropSync` (metadata) runs
-daily, `contentSync` (article bodies) hourly. Because `raindropSync` re-mirrors
-the whole library each run, a frequent schedule is the main cost driver — keep it
-infrequent for large libraries.
+### Schedules
+
+The two syncs run on independent schedules, set via `METADATA_SCHEDULE` (default
+`1d`) and `CONTENT_SCHEDULE` (default `1h`). Each accepts `continuous`, `manual`,
+or an interval like `30m`, `6h`, `1d`; an unrecognized value is ignored (with a
+warning) in favor of the default. A schedule change takes effect on the next
+`bun run deploy`.
+
+They differ on purpose, because the two syncs have very different costs:
+
+- **Metadata** (`raindropSync`) runs in `replace` mode, re-mirroring the *whole*
+  library each run (~78 paged requests per 3,900 bookmarks). Its cost scales with
+  library size, not with how much changed, so a frequent schedule is the main
+  cost driver — **make it less frequent for large libraries.** It's also what
+  propagates deletions.
+- **Article content** (`contentSync`) is incremental — it only processes
+  bookmarks newer than a saved cursor, so most runs do almost nothing. That makes
+  a frequent (hourly) schedule cheap and keeps new articles fresh.
+
+See [docs/DESIGN.md](docs/DESIGN.md#sync-architecture) for the freshness
+trade-offs (e.g. with content off, new bookmarks appear on the metadata
+schedule).
 
 ## What gets synced
 
