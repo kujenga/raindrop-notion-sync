@@ -1,0 +1,38 @@
+# CI deliberately uses npm/node instead of Bun: the Notion Workers remote
+# build runs `npm install` + `npm run build` on node, so mirroring that here
+# catches accidental reliance on Bun-only APIs before it can break a deploy.
+#
+# No secrets are needed: src/raindrop-options.ts is committed empty but
+# well-formed, so a clean checkout typechecks and builds without a Raindrop
+# token. Do not add refresh-options or deploy steps here.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # `npm install`, not `npm ci`: the repo commits bun.lock, and npm ci
+      # requires a package-lock.json.
+      - run: npm install
+
+      - run: npm run typecheck
+
+      - run: npm run build
