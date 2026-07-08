@@ -82,22 +82,34 @@ async function raindropGet<T>(token: string, path: string): Promise<T> {
 }
 
 /**
+ * Sort order for a raindrops listing. Beware: the API breaks sort-key ties in
+ * a different (but per-offset deterministic) order on every page request, so a
+ * paged walk over a non-unique key can return one item twice and never return
+ * its neighbor. `created` is effectively unique per bookmark; `lastUpdate` is
+ * not — bulk edits stamp whole swaths of a library with the same millisecond.
+ */
+export type RaindropSort = "-lastUpdate" | "created";
+
+/**
  * Fetch one page of raindrops from a collection.
  *
  * @param token   Raindrop API token (test token or OAuth bearer token).
  * @param collectionId  Collection id. `0` = all, `-1` = unsorted, `-99` = trash.
  * @param page    Zero-based page index.
+ * @param perpage Page size (max {@link PER_PAGE}).
+ * @param sort    Listing order; see {@link RaindropSort} for the tie caveat.
  */
 export async function getRaindrops(
   token: string,
   collectionId: number,
   page: number,
   perpage: number = PER_PAGE,
+  sort: RaindropSort = "-lastUpdate",
 ): Promise<Raindrop[]> {
   const params = new URLSearchParams({
     perpage: String(perpage),
     page: String(page),
-    sort: "-lastUpdate",
+    sort,
   });
   const data = await raindropGet<RaindropsResponse>(
     token,
