@@ -106,6 +106,7 @@ use `bun run preview`.
 | `GEMINI_API_KEY`         | if `SYNC_CONTENT=1` | — | Google Gemini key, used to clean article content.  |
 | `FULL_SYNC_SCHEDULE`     | no       | `1d`    | How often the full mirror runs (see below).        |
 | `INCREMENTAL_SYNC_SCHEDULE` | no    | `1h`    | How often new/changed bookmarks are picked up between full mirrors. |
+| `MAX_ARCHIVE_RETRIES`    | no       | `24`    | Retry attempts for an article whose permanent copy isn't ready before giving up (`0` = never retry). |
 
 Set these in `.env` for local runs; `bun run deploy` pushes them to the deployed
 worker. To change a secret on the deployed worker without a full redeploy:

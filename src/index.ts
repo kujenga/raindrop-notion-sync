@@ -86,6 +86,28 @@ const INCREMENTAL_SYNC_SCHEDULE = scheduleFromEnv(
   "1h",
 );
 
+/** Read a non-negative integer from an env var, warning + falling back on junk. */
+function intFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (Number.isInteger(n) && n >= 0) return n;
+  console.warn(
+    `Ignoring invalid ${name}="${raw}"; expected a non-negative integer. ` +
+      `Falling back to ${fallback}.`,
+  );
+  return fallback;
+}
+
+/**
+ * How many times a bookmark whose permanent copy isn't ready is retried before
+ * the sync gives up on its article (the page keeps metadata + annotations).
+ * Bounds queue churn from pages Raindrop can never archive — paywalled or
+ * bot-blocked sites often sit in an absent/"retry" cache status forever rather
+ * than reaching a terminal one. 0 disables retries entirely.
+ */
+const MAX_ARCHIVE_RETRIES = intFromEnv("MAX_ARCHIVE_RETRIES", 24);
+
 /** Sentinel cursor: an incremental sync with this cursor has seen nothing yet. */
 const EPOCH = "1970-01-01T00:00:00.000Z";
 
@@ -297,8 +319,13 @@ interface IncrementalState {
   cursor?: string;
   /** Max `lastUpdate` seen this run; becomes the next run's cursor. */
   maxSeen?: string;
-  /** Ids whose permanent copy wasn't ready yet, retried on later runs. */
-  pending?: number[];
+  /**
+   * id → retry attempts used so far, for bookmarks whose permanent copy wasn't
+   * ready yet. Retried on later runs, up to MAX_ARCHIVE_RETRIES. Earlier
+   * versions persisted a plain id array; that shape is still accepted on read
+   * (attempts start at 0).
+   */
+  pending?: number[] | Record<string, number>;
   /**
    * id → the permanent copy's `cache.created` time (ms) we last cleaned. Lets a
    * bookmark that's merely been re-touched (a new tag, moved collection) skip
@@ -323,7 +350,9 @@ interface IncrementalState {
  * content syncing on it additionally cleans full-article bodies: articles
  * already cleaned at their current version get a metadata-only upsert (body
  * preserved), the rest are cleaned with bounded concurrency, and items whose
- * permanent copy isn't built yet go to a `pending` list retried next run.
+ * permanent copy isn't built yet go to a `pending` queue retried on later runs
+ * (up to MAX_ARCHIVE_RETRIES attempts, so unarchivable pages don't churn
+ * forever).
  *
  * It does NOT delete — removals are handled by fullSync's `replace` mode — so
  * it stays cheap after the first run walks the backlog. `incremental` mode
@@ -354,8 +383,35 @@ worker.sync("incrementalSync", {
     const page = flipped ? 0 : (state?.page ?? 0);
     const cursor = backfill ? EPOCH : (state?.cursor ?? EPOCH);
     let maxSeen = state?.maxSeen ?? (backfill ? EPOCH : cursor);
-    const pending = new Set(state?.pending ?? []);
+    // id → attempts used. Accept the legacy array shape (pre-cap deploys).
+    const pending = new Map<number, number>(
+      Array.isArray(state?.pending)
+        ? state.pending.map((id) => [id, 0])
+        : Object.entries(state?.pending ?? {}).map(([id, n]) => [Number(id), n]),
+    );
     const done: Record<string, number> = { ...(state?.done ?? {}) };
+
+    /** Attempts already used by items pulled from the queue this run. */
+    const usedAttempts = new Map<number, number>();
+    /**
+     * Queue an article retry, spending one attempt; items that exhaust
+     * MAX_ARCHIVE_RETRIES are dropped for good (their page keeps metadata +
+     * annotations). First-time adds enter with 0 attempts used.
+     */
+    const requeue = (id: number) => {
+      const attempts = (usedAttempts.get(id) ?? -1) + 1;
+      if (attempts >= MAX_ARCHIVE_RETRIES) {
+        console.log(
+          `incrementalSync: giving up on article for ${id} after ${attempts} attempts`,
+        );
+        return;
+      }
+      if (pending.size < MAX_PENDING) pending.set(id, attempts);
+    };
+    /** Defer a cleanable item to the next run without spending an attempt. */
+    const defer = (id: number) => {
+      if (pending.size < MAX_PENDING) pending.set(id, usedAttempts.get(id) ?? 0);
+    };
 
     // Metadata-only pages can be large (an upsert per item is cheap); content
     // pages stay small to bound permanent-copy fetches + model calls per call.
@@ -366,8 +422,9 @@ worker.sync("incrementalSync", {
     // toggle-on) plus the next page of the delta.
     const candidates: Raindrop[] = [];
     if (CONTENT_ENABLED && page === 0 && pending.size > 0) {
-      for (const id of [...pending].slice(0, CONTENT_PER_PAGE)) {
+      for (const [id, attempts] of [...pending].slice(0, CONTENT_PER_PAGE)) {
         pending.delete(id);
+        usedAttempts.set(id, attempts);
         await incrementalApiPacer.wait();
         const item = await getRaindrop(token, id);
         if (item) candidates.push(item);
@@ -406,7 +463,7 @@ worker.sync("incrementalSync", {
         // No ready permanent copy: write annotations now, and retry the article
         // only if a copy could still be built (skip terminal-failure states so
         // they don't churn in the retry backlog forever).
-        if (isArchivePending(item)) pending.add(item._id);
+        if (isArchivePending(item)) requeue(item._id);
         changes.push(buildUpsert(item, buildAnnotations(item)));
         continue;
       }
@@ -421,9 +478,10 @@ worker.sync("incrementalSync", {
       toClean.push(item);
     }
 
-    // Clean the article batch with bounded concurrency; defer any overflow.
+    // Clean the article batch with bounded concurrency; defer any overflow
+    // (deferral is scheduling, not failure — it doesn't spend an attempt).
     for (const item of toClean.slice(CONTENT_PER_PAGE)) {
-      pending.add(item._id);
+      defer(item._id);
       changes.push(buildUpsert(item, buildAnnotations(item)));
     }
     const results = await mapWithConcurrency(
@@ -443,16 +501,17 @@ worker.sync("incrementalSync", {
         changes.push(buildUpsert(item, buildFullBody(item, extracted)));
         done[String(item._id)] = articleVersion(item) as number;
       } else {
-        if (pending.size < MAX_PENDING) pending.add(item._id);
+        requeue(item._id);
         changes.push(buildUpsert(item, buildAnnotations(item)));
       }
     }
 
     const hasMore = !reachedEnd;
     const contentOn = CONTENT_ENABLED;
+    const pendingOut = Object.fromEntries(pending);
     const nextState: IncrementalState = hasMore
-      ? { page: page + 1, cursor, maxSeen, pending: [...pending], done, contentOn }
-      : { cursor: maxSeen, pending: [...pending], done, contentOn };
+      ? { page: page + 1, cursor, maxSeen, pending: pendingOut, done, contentOn }
+      : { cursor: maxSeen, pending: pendingOut, done, contentOn };
     return { changes, hasMore, nextState };
   },
 });

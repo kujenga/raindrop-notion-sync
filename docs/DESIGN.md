@@ -85,7 +85,14 @@ work:
   the existing body is left in place. An article is re-cleaned only when its
   permanent copy is rebuilt.
 - It cleans a batch with **bounded concurrency** (up to 8 model calls at once).
-- It **retries** bookmarks whose permanent copy isn't built yet.
+- It **retries** bookmarks whose permanent copy isn't built yet — up to
+  `MAX_ARCHIVE_RETRIES` attempts (default 24). Raindrop archives asynchronously,
+  and paywalled or bot-blocked pages can sit in a not-ready state forever rather
+  than reaching a terminal failure; the cap keeps them from churning in the
+  retry queue indefinitely. A capped-out bookmark keeps its metadata +
+  annotations page, and gets another shot the next time the bookmark is touched
+  in Raindrop — any edit bumps `lastUpdate`, which re-enters it through the
+  normal delta path.
 
 **Trade-off:** because an article is cleaned only once (until its permanent copy
 is rebuilt), notes or highlights added *after* its article has been synced won't
