@@ -192,7 +192,16 @@ worker.sync("fullSync", {
     const page = state?.page ?? 0;
 
     await fullSyncPacer.wait();
-    const items = await getRaindrops(token, collectionId, page);
+    // Walk oldest-first by `created`, NOT by -lastUpdate. Bulk edits leave
+    // clusters of bookmarks sharing the same lastUpdate millisecond, and the
+    // API orders tied items differently for each page request — a -lastUpdate
+    // walk returns some items twice and never returns their displaced
+    // neighbors, and the mark-and-sweep then deletes the skipped pages
+    // (observed live: the same 49 bookmarks skipped on every walk). `created`
+    // is effectively unique per bookmark, and ascending order means a bookmark
+    // saved mid-run lands past the walk frontier instead of shifting every
+    // rank behind it.
+    const items = await getRaindrops(token, collectionId, page, PER_PAGE, "created");
 
     const changes = items.map((item) =>
       buildUpsert(item, CONTENT_ENABLED ? "" : buildAnnotations(item)),
@@ -431,7 +440,11 @@ worker.sync("incrementalSync", {
       }
     }
     await incrementalApiPacer.wait();
-    const items = await getRaindrops(token, collectionId, page, perPage);
+    // Newest-first is what lets the walk stop at the cursor. A lastUpdate tie
+    // straddling a page boundary can still skip an item here (see the sort
+    // note on fullSync), but the cost is bounded — a stale page until the
+    // next full mirror — because this pass never deletes.
+    const items = await getRaindrops(token, collectionId, page, perPage, "-lastUpdate");
     let reachedEnd = items.length < perPage;
     for (const item of items) {
       if (item.lastUpdate <= cursor) {
